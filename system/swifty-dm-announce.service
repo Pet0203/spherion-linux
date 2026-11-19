@@ -1,0 +1,27 @@
+[Unit]
+Description=Announce the firmware's device-mapper devices to udev
+Documentation=man:udevadm(8)
+DefaultDependencies=no
+Wants=systemd-udevd.service
+After=systemd-udevd.service
+Before=systemd-udev-trigger.service local-fs-pre.target shutdown.target
+Conflicts=shutdown.target
+
+# udev acts on "change" events for device-mapper and ignores "add" outright,
+# because a dm device is unusable between its creation and the resume that
+# gives it a table. dm-mod.create= does both in a late_initcall, before udevd
+# exists, so that event is lost and coldplug replays only "add": the volumes
+# end up with no /dev/mapper name, no by-uuid link and no .device unit, and
+# nothing but the root filesystem can mount.
+#
+# This runs before systemd-udev-trigger rather than after it: the two full
+# coldplug passes take about a second, and everything waiting on these device
+# units waits that long too.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=udevadm trigger --type=devices --action=change --subsystem-match=block --sysname-match=dm-* --settle
+
+[Install]
+WantedBy=sysinit.target

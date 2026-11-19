@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pet0203 <Pet0203@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:00:00 +0000
+Subject: [PATCH] drm/panfrost: unprepare the GPU clocks across system suspend
+
+On MediaTek SoCs (MT8192 here) the GPU clock's parent, mfgpll, is a PLL
+that is powered in .prepare/.unprepare, not in .enable/.disable. The
+GPU_PM_CLK_DIS system-suspend path only calls clk_disable(), so mfgpll
+stays prepared, and therefore running, for the whole of suspend.
+
+A running PLL keeps the SPM from dropping the 26 MHz bus clock, so the SoC
+never reaches its deep suspend state and never asserts AP_IN_SLEEP_L. The
+ChromeOS EC waits for that signal: when it does not arrive, the EC's
+sleep-hang detection fires ("Detected sleep hang! Waking host up!") and
+wakes the machine a few seconds after it went to sleep.
+
+Use clk_disable_unprepare() on suspend and clk_prepare_enable() on resume
+so the PLL really stops.
+
+This is for v7.3 and older, and does not apply to v7.4, which reworks the
+driver's clock handling into panfrost_clks_enable() and
+panfrost_clks_disable(). The rework does not fix the problem. The suspend
+path there does call clk_disable_unprepare(), but panfrost_clk_init() now
+holds a second clk_prepare() of its own on each clock, so the prepare count
+never reaches zero and the PLL is still left running across suspend. That
+is from reading v7.4-rc3, not from a test on it; v7.4 needs its own
+version of this fix.
+---
+ drivers/gpu/drm/panfrost/panfrost_device.c | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_device.c b/drivers/gpu/drm/panfrost/panfrost_device.c
+index d0a23c51b..8aa435cac 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_device.c
++++ b/drivers/gpu/drm/panfrost/panfrost_device.c
+@@ -508,12 +508,12 @@ static int panfrost_device_resume(struct device *dev)
+ 	}
+ 
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS)) {
+-		ret = clk_enable(pfdev->clock);
++		ret = clk_prepare_enable(pfdev->clock);
+ 		if (ret)
+ 			goto err_clk;
+ 
+ 		if (pfdev->bus_clock) {
+-			ret = clk_enable(pfdev->bus_clock);
++			ret = clk_prepare_enable(pfdev->bus_clock);
+ 			if (ret)
+ 				goto err_bus_clk;
+ 		}
+@@ -527,10 +527,10 @@ static int panfrost_device_resume(struct device *dev)
+ 
+ err_resume:
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS) && pfdev->bus_clock)
+-		clk_disable(pfdev->bus_clock);
++		clk_disable_unprepare(pfdev->bus_clock);
+ err_bus_clk:
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS))
+-		clk_disable(pfdev->clock);
++		clk_disable_unprepare(pfdev->clock);
+ err_clk:
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_VREG_OFF))
+ 		dev_pm_opp_set_opp(dev, NULL);
+@@ -548,9 +548,9 @@ static int panfrost_device_suspend(struct device *dev)
+ 
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS)) {
+ 		if (pfdev->bus_clock)
+-			clk_disable(pfdev->bus_clock);
++			clk_disable_unprepare(pfdev->bus_clock);
+ 
+-		clk_disable(pfdev->clock);
++		clk_disable_unprepare(pfdev->clock);
+ 	}
+ 
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_VREG_OFF))

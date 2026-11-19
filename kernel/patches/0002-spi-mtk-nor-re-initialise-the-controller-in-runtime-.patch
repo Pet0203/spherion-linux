@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pet0203 <Pet0203@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:00:00 +0000
+Subject: [PATCH] spi: mtk-nor: re-initialise the controller in runtime resume
+
+mtk_nor_resume() calls pm_runtime_force_resume() and then mtk_nor_init().
+If the controller was already runtime-suspended when the system went to
+sleep, pm_runtime_force_resume() does not run the runtime-resume callback,
+so the clocks stay gated and mtk_nor_init() writes to a clock-gated block.
+On MT8192 (google,spherion) that hangs resume in dpm_resume_end() and the
+screen stays black.
+
+Move the controller init into mtk_nor_runtime_resume(), after the clocks
+have been enabled, and make system resume only call
+pm_runtime_force_resume(). The controller is then re-initialised right
+there if it was active at suspend, and on first use otherwise.
+
+The obvious smaller workaround, dropping the pm_runtime_force_resume() call
+from system resume, also avoids the hang but is wrong: it leaves runtime PM
+disabled after the first suspend, and every later access to the flash
+(/dev/mtd0: flashrom, crossystem, firmware updates) fails with
+"Failed to power device: -13" until the next reboot.
+
+Tested on spherion: the SPI NOR is back to runtime PM "auto"/"suspended"
+after resume and can be read with flashrom -p linux_mtd every time.
+---
+ drivers/spi/spi-mtk-nor.c | 33 +++++++++++++++++++++------------
+ 1 file changed, 21 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/spi/spi-mtk-nor.c b/drivers/spi/spi-mtk-nor.c
+index 63f513917..1eb663188 100644
+--- a/drivers/spi/spi-mtk-nor.c
++++ b/drivers/spi/spi-mtk-nor.c
+@@ -967,8 +967,19 @@ static int mtk_nor_runtime_resume(struct device *dev)
+ {
+ 	struct spi_controller *ctlr = dev_get_drvdata(dev);
+ 	struct mtk_nor *sp = spi_controller_get_devdata(ctlr);
++	int ret;
++
++	ret = mtk_nor_enable_clk(sp);
++	if (ret)
++		return ret;
+ 
+-	return mtk_nor_enable_clk(sp);
++	/*
++	 * The controller can lose its register state while the clocks are
++	 * gated, so re-initialise it here, where the clocks are running.
++	 */
++	mtk_nor_init(sp);
++
++	return 0;
+ }
+ 
+ static int mtk_nor_suspend(struct device *dev)
+@@ -978,17 +989,15 @@ static int mtk_nor_suspend(struct device *dev)
+ 
+ static int mtk_nor_resume(struct device *dev)
+ {
+-	struct spi_controller *ctlr = dev_get_drvdata(dev);
+-	struct mtk_nor *sp = spi_controller_get_devdata(ctlr);
+-	int ret;
+-
+-	ret = pm_runtime_force_resume(dev);
+-	if (ret)
+-		return ret;
+-
+-	mtk_nor_init(sp);
+-
+-	return 0;
++	/*
++	 * Do not touch the controller registers here. If the controller was
++	 * already runtime-suspended when the system went to sleep,
++	 * pm_runtime_force_resume() leaves its clocks gated, and writing to a
++	 * clock-gated block hangs resume on MT8192 (black screen). The
++	 * controller is re-initialised in mtk_nor_runtime_resume() instead:
++	 * right here if it was active at suspend, otherwise on first use.
++	 */
++	return pm_runtime_force_resume(dev);
+ }
+ 
+ static const struct dev_pm_ops mtk_nor_pm_ops = {

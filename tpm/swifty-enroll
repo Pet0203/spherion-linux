@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""swifty-enroll: the Cr50 side of the firmware disk unlock.
+
+Puts dm-crypt volume keys into a Cr50 NV index that the patched depthcharge in
+this repository reads at boot, after a PIN.
+
+The Cr50 has no TPM2_PolicyGetDigest and no trial sessions, so nothing can ask
+it what a policy digest should be. The digest has to be computed in software,
+and it has to match what the chip computes when the firmware replays the policy
+at boot, or the unlock fails with nothing to see. This tool owns that
+computation, and `check` proves it against the real chip before any of it is
+trusted.
+
+The policy is: PolicyPCR over PCR0 (boot mode), PCR1 (HWID) and PCR12 (the cap
+depthcharge extends after reading), followed by PolicyAuthValue, which is what
+makes the PIN an HMAC rather than a secret crossing the bus.
+
+  swifty-enroll policy            print the policy digest for the current PCRs
+  swifty-enroll check [--cap]     prove the digest against the TPM on a
+                                  throwaway index; --cap also proves that
+                                  extending PCR12 locks the index for the rest
+                                  of this boot (one way until reboot)
+  swifty-enroll enroll KEY...     define the real index and write the volume
+                                  keys into it, then read them back through
+                                  the policy to prove the firmware will get
+                                  them. Each KEY is DESCRIPTION=FILE, e.g.
+                                  swifty:root=/run/vk-root
+
+Needs tpm2-tools and access to the TPM (root). Run it on the machine itself,
+booted in normal mode with the firmware you intend to keep: PCR0 and PCR1 are
+read live and become part of the policy.
+
+The index's authValue is passed to tpm2-tools on the command line, where other
+local users could see it in the process list while a command runs. Enrol with
+nobody else logged in.
+"""
+
+import argparse
+import contextlib
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# The PIN is never used directly: the index's authValue is a digest of it, so
+# a short PIN still presents a full-length secret to the HMAC.
+DOMAIN = b"swifty-unlock-v1"
+
+TPM_CC_PolicyPCR = 0x0000017F
+TPM_CC_PolicyAuthValue = 0x0000016B
+TPM_ALG_SHA256 = 0x000B
+
+PCRS = (0, 1, 12)
+TEST_INDEX = "0x01500123"
+
+# The real index, and the block layout the firmware expects to find in it.
+# These are fixed on the other side by UNLOCK_NV_INDEX, UNLOCK_NV_KEY_COUNT,
+# UNLOCK_KEY_DESC_MAX and UNLOCK_KEY_SIZE_MAX in depthcharge's
+# src/vboot/unlock.h and unlock.c. If they ever disagree the unlock fails with
+# nothing useful to say, so change both or neither.
+UNLOCK_INDEX = "0x01500001"
+KEY_COUNT = 2
+KEY_DESC_MAX = 128
+KEY_SIZE_MAX = 256
+KEY_ENTRY = 4 + KEY_DESC_MAX + KEY_SIZE_MAX          # 388
+BLOCK_SIZE = 4 + KEY_COUNT * KEY_ENTRY               # 780
+
+
+def tpm(*args, check=True, capture=True):
+    return subprocess.run(args, capture_output=capture, text=True, check=check)
+
+
+@contextlib.contextmanager
+def scratch():
+    """A private directory for the files tpm2-tools wants its input in.
+
+    Some of them hold the volume keys. The directory is created 0700 with an
+    unpredictable name and removed on the way out, whatever happened.
+    """
+    path = tempfile.mkdtemp(prefix="swifty-enroll-")
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def read_pcr(n):
+    out = tpm("tpm2_pcrread", f"sha256:{n}").stdout
+    m = re.search(r"0x([0-9A-Fa-f]{64})", out)
+    if not m:
+        sys.exit(f"could not read PCR{n}")
+    return bytes.fromhex(m.group(1))
+
+
+def pcr_selection(pcrs=PCRS):
+    """TPML_PCR_SELECTION, marshalled exactly as the TPM hashes it."""
+    bitmap = bytearray(3)
+    for p in pcrs:
+        bitmap[p // 8] |= 1 << (p % 8)
+    return (
+        (1).to_bytes(4, "big")              # count: one selection
+        + TPM_ALG_SHA256.to_bytes(2, "big")
+        + bytes([len(bitmap)])
+        + bytes(bitmap)
+    )
+
+
+def policy_digest(values):
+    """PolicyPCR then PolicyAuthValue, starting from a zeroed digest."""
+    pcr_digest = hashlib.sha256(b"".join(values)).digest()
+    d = bytes(32)
+    d = hashlib.sha256(
+        d + TPM_CC_PolicyPCR.to_bytes(4, "big") + pcr_selection() + pcr_digest
+    ).digest()
+    d = hashlib.sha256(d + TPM_CC_PolicyAuthValue.to_bytes(4, "big")).digest()
+    return d, pcr_digest
+
+
+def auth_value(pin):
+    return hashlib.sha256(DOMAIN + pin.encode()).digest()
+
+
+def current_policy():
+    """The policy as it must look at UNLOCK time, not right now.
+
+    PCR0 and PCR1 are set by the firmware and hold their value for the whole
+    boot, so they are read live. PCR12 is different: depthcharge reads the
+    index while PCR12 is still zero and only then extends it. Enrollment runs
+    later, in the booted OS, where PCR12 is already capped -- binding to the
+    value we can see here would produce a policy that nothing can ever
+    satisfy. So PCR12 is taken as zero, which is what the firmware will
+    present.
+    """
+    values = [read_pcr(0), read_pcr(1), bytes(32)]
+    return policy_digest(values) + (values,)
+
+
+def cmd_policy(_args):
+    digest, pcr_dig, values = current_policy()
+    for p, v in zip(PCRS, values):
+        note = "  (zero: the value at unlock time)" if p == 12 else ""
+        print(f"  PCR{p:<3} {v.hex()}{note}")
+    print(f"  pcr digest     {pcr_dig.hex()}")
+    print(f"  policy digest  {digest.hex()}")
+
+
+def cmd_check(args):
+    live12 = read_pcr(12)
+    if live12 != bytes(32):
+        print("PCR12 is already extended this boot:")
+        print(f"  {live12.hex()}")
+        print("The policy binds PCR12=0, the value depthcharge sees, so a read")
+        print("cannot succeed now. Reboot and run this before anything caps it.")
+        return 1
+    digest, _, _ = current_policy()
+    print(f"policy digest computed here: {digest.hex()}")
+    pin = "checkpin"
+
+    with scratch() as tmp:
+        pol = os.path.join(tmp, "policy")
+        secret = os.path.join(tmp, "secret")
+        ses = os.path.join(tmp, "session")
+        with open(pol, "wb") as f:
+            f.write(digest)
+
+        tpm("tpm2_nvundefine", TEST_INDEX, "-C", "o", check=False)
+        tpm("tpm2_nvdefine", TEST_INDEX, "-C", "o", "-s", "32",
+            "-a", "policyread|ownerwrite", "-L", pol,
+            "-p", f"hex:{auth_value(pin).hex()}")
+        with open(secret, "wb") as f:
+            f.write(b"A" * 32)
+        tpm("tpm2_nvwrite", TEST_INDEX, "-C", "o", "-i", secret)
+
+        def policy_read(pin_try):
+            tpm("tpm2_startauthsession", "--policy-session", "-S", ses, check=False)
+            tpm("tpm2_policypcr", "-S", ses,
+                "-l", "sha256:" + ",".join(str(p) for p in PCRS), check=False)
+            tpm("tpm2_policyauthvalue", "-S", ses, check=False)
+            r = tpm("tpm2_nvread", TEST_INDEX, "-P",
+                    f"session:{ses}+hex:{auth_value(pin_try).hex()}", check=False)
+            tpm("tpm2_flushcontext", ses, check=False)
+            return r.returncode == 0
+
+        ok = policy_read(pin)
+        print(f"  correct PIN through a policy session: {'READ OK' if ok else 'REFUSED'}")
+        bad = policy_read("wrongpin")
+        print(f"  wrong PIN:                            {'ACCEPTED (BAD)' if bad else 'refused'}")
+
+        capped = None
+        if args.cap:
+            tpm("tpm2_pcrextend", "12:sha256=" + hashlib.sha256(b"cap").hexdigest(), check=False)
+            capped = policy_read(pin)
+            print(f"  after extending PCR12:                "
+                  f"{'STILL READABLE (BAD)' if capped else 'refused, as designed'}")
+
+        tpm("tpm2_nvundefine", TEST_INDEX, "-C", "o", check=False)
+
+    good = ok and not bad and (capped is not True)
+    print("RESULT:", "the software digest matches the TPM" if good else "MISMATCH")
+    return 0 if good else 1
+
+
+def build_block(keys):
+    """The handover block, laid out as the C struct the firmware reads.
+
+    Little-endian, because that is how an aarch64 struct sits in memory: the
+    firmware casts the page, it does not parse it. dm-crypt wants a "logon"
+    key, whose description must be qualified -- "swifty:root", not "root".
+    """
+    if len(keys) > KEY_COUNT:
+        sys.exit(f"the firmware has room for {KEY_COUNT} keys, got {len(keys)}")
+    out = bytearray(BLOCK_SIZE)
+    out[0:4] = len(keys).to_bytes(4, "little")
+    for i, (desc, data) in enumerate(keys):
+        if ":" not in desc or desc.startswith(":"):
+            sys.exit(f'"{desc}" is not a logon description ("prefix:name")')
+        d = desc.encode()
+        if len(d) >= KEY_DESC_MAX:
+            sys.exit(f'"{desc}" is too long for the {KEY_DESC_MAX}-byte field')
+        if not data or len(data) > KEY_SIZE_MAX:
+            sys.exit(f'"{desc}" is {len(data)} bytes, must be 1..{KEY_SIZE_MAX}')
+        off = 4 + i * KEY_ENTRY
+        out[off:off + 4] = len(data).to_bytes(4, "little")
+        out[off + 4:off + 4 + len(d)] = d
+        out[off + 4 + KEY_DESC_MAX:off + 4 + KEY_DESC_MAX + len(data)] = data
+    return bytes(out)
+
+
+def read_pin(args):
+    if args.pin_file:
+        with open(args.pin_file) as f:
+            pin = f.readline().rstrip("\n")
+        if not pin:
+            sys.exit(f"{args.pin_file} is empty")
+        return pin
+    import getpass
+    pin = getpass.getpass("PIN: ")
+    if pin != getpass.getpass("PIN again: "):
+        sys.exit("the two PINs differ")
+    if not pin:
+        sys.exit("an empty PIN would let anyone through")
+    return pin
+
+
+def cmd_enroll(args):
+    live12 = read_pcr(12)
+    if live12 != bytes(32):
+        print("PCR12 is already extended this boot; the read-back cannot work.")
+        print("Reboot and enroll before anything caps it.")
+        return 1
+
+    keys = []
+    for spec in args.key:
+        desc, _, path = spec.partition("=")
+        if not path:
+            sys.exit(f'"{spec}" is not DESCRIPTION=FILE')
+        with open(path, "rb") as f:
+            keys.append((desc, f.read()))
+    block = build_block(keys)
+
+    pin = read_pin(args)
+    auth = auth_value(pin)
+    digest, _, _ = current_policy()
+    print(f"index          {args.index}")
+    print(f"policy digest  {digest.hex()}")
+    for desc, data in keys:
+        print(f"key            {desc}  ({len(data)} bytes)")
+
+    if args.dry_run:
+        with open(args.dry_run, "wb") as f:
+            f.write(block)
+        print(f"wrote the {len(block)}-byte block to {args.dry_run}; TPM untouched")
+        return 0
+
+    with scratch() as tmp:
+        pol = os.path.join(tmp, "policy")
+        blk = os.path.join(tmp, "block")
+        got = os.path.join(tmp, "readback")
+        ses = os.path.join(tmp, "session")
+        with open(pol, "wb") as f:
+            f.write(digest)
+        with open(blk, "wb") as f:
+            f.write(block)
+
+        if args.replace:
+            tpm("tpm2_nvundefine", args.index, "-C", "o", check=False)
+        r = tpm("tpm2_nvdefine", args.index, "-C", "o", "-s", str(BLOCK_SIZE),
+                "-a", "policyread|ownerwrite", "-L", pol,
+                "-p", f"hex:{auth.hex()}", check=False)
+        if r.returncode:
+            print(r.stderr.strip())
+            print("If the index already exists, re-run with --replace.")
+            return 1
+        tpm("tpm2_nvwrite", args.index, "-C", "o", "-i", blk)
+
+        # Read it back the way the firmware will: a policy session, the PIN as
+        # an HMAC key, nothing else. This is the only chance to prove it --
+        # once PCR12 is capped the index is shut until the next boot.
+        tpm("tpm2_startauthsession", "--policy-session", "-S", ses, check=False)
+        tpm("tpm2_policypcr", "-S", ses,
+            "-l", "sha256:" + ",".join(str(p) for p in PCRS), check=False)
+        tpm("tpm2_policyauthvalue", "-S", ses, check=False)
+        rb = tpm("tpm2_nvread", args.index, "-s", str(BLOCK_SIZE), "-o", got,
+                 "-P", f"session:{ses}+hex:{auth.hex()}", check=False)
+        tpm("tpm2_flushcontext", ses, check=False)
+
+        if rb.returncode:
+            print("read-back through the policy FAILED:", rb.stderr.strip())
+            return 1
+        with open(got, "rb") as f:
+            back = f.read()
+        if back != block:
+            print("read-back differs from what was written")
+            return 1
+        print(f"read back {len(back)} bytes through the policy: identical")
+        print("enrolled. The firmware will ask for this PIN at the next boot")
+        print("of a kernel whose command line has dm-mod.create=.")
+        return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("policy").set_defaults(func=cmd_policy)
+    c = sub.add_parser("check")
+    c.add_argument("--cap", action="store_true",
+                   help="also extend PCR12; one way until the next reboot")
+    c.set_defaults(func=cmd_check)
+    e = sub.add_parser("enroll")
+    e.add_argument("key", nargs="+", metavar="DESCRIPTION=FILE",
+                   help="a logon key description and the file holding it, e.g. "
+                        "swifty:root=/run/vk-root")
+    e.add_argument("--index", default=UNLOCK_INDEX,
+                   help=f"NV index (default {UNLOCK_INDEX}, what the firmware reads)")
+    e.add_argument("--pin-file", help="read the PIN from this file instead of asking")
+    e.add_argument("--replace", action="store_true",
+                   help="undefine an existing index first")
+    e.add_argument("--dry-run", metavar="FILE",
+                   help="write the block to FILE and stop; the TPM is not touched")
+    e.set_defaults(func=cmd_enroll)
+    args = ap.parse_args()
+    # Nothing this writes -- the --dry-run block least of all -- is for anyone
+    # else to read.
+    os.umask(0o077)
+    sys.exit(args.func(args) or 0)
+
+
+if __name__ == "__main__":
+    main()

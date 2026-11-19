@@ -1,0 +1,567 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pet0203 <Pet0203@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:00:00 +0000
+Subject: [PATCH] vboot: add a firmware disk unlock
+
+Read disk keys out of the Cr50 and hand them to the kernel, so that an
+encrypted root can be opened without an initramfs.
+
+The keys sit in an NV index whose policy is PolicyPCR over PCR0, PCR1 and
+PCR12, followed by PolicyAuthValue. The index therefore opens only in
+normal mode (PCR0), on this machine (PCR1), before the cap (PCR12), and
+only to someone who knows the PIN. Developer mode, recovery mode, a
+different board or an already-booted OS each present different PCRs and get
+nothing.
+
+The PIN is not sent to the TPM. It is hashed with a domain string into the
+index's authValue and used as an HMAC key. The reply is HMACed as well and
+checked, so the keys cannot be substituted by something else driving the
+bus.
+
+PCR12 is extended on every path out of this code, including the failures.
+By the time the kernel starts the index is unreadable, so root on the
+running system cannot read it again until the next boot.
+
+The handover block reuses the layout the kernel already has for kdump's
+dm-crypt keys. It is published both as a /reserved-memory node with no-map
+and as a /chosen property, "linux,dm-boot-keys": four cells, a 64-bit
+address then a 64-bit length. no-map matters: without it the kernel is free
+to hand those pages to something else before the keys have been wiped.
+
+The prompt is a drawn screen, like depthcharge's own recovery and developer
+screens: ui_draw_text() puts font bitmaps on the framebuffer. printf() does
+not reach the panel, because depthcharge binds no video console. The screen
+is redrawn on every keystroke so a row of asterisks grows as the PIN is
+typed, a refused PIN says so on the screen, and the panel is cleared before
+the kernel starts. On asurada this needs coreboot to have brought the
+display up (see the coreboot patch in this repository).
+
+PIN entry accepts only VB_KEY_FLAG_TRUSTED_KEYBOARD, which excludes USB
+keyboards.
+
+Limits, stated plainly:
+
+ - The key block crosses the Cr50's SPI bus unencrypted (no parameter
+   encryption on the session). A probe on those lines during an unlock
+   records the keys.
+ - Guessing is not rate limited by the TPM. The Cr50 ships with
+   dictionary-attack lockout disabled, and on the unit this was developed
+   on (RW 0.5.241) it did not keep lockout parameters across a reboot. The
+   three tries per boot here only bound typos, so the PIN has to be strong
+   enough to survive guessing at reboot speed.
+ - VB_KEY_FLAG_TRUSTED_KEYBOARD also admits the serial console, which on
+   these machines is the CCD debug UART behind a debug cable.
+ - The NV index is defined in the owner hierarchy, whose authorisation is
+   left empty, so root on the running system can delete or rewrite it.
+   That is denial of service, not a way to read the keys.
+
+Nothing calls this yet; the next patch does.
+---
+ src/vboot/Makefile.inc |   1 +
+ src/vboot/unlock.c     | 443 +++++++++++++++++++++++++++++++++++++++++
+ src/vboot/unlock.h     |  34 ++++
+ 3 files changed, 478 insertions(+)
+ create mode 100644 src/vboot/unlock.c
+ create mode 100644 src/vboot/unlock.h
+
+diff --git a/src/vboot/Makefile.inc b/src/vboot/Makefile.inc
+index 4201f7a..d820aa0 100644
+--- a/src/vboot/Makefile.inc
++++ b/src/vboot/Makefile.inc
+@@ -14,6 +14,7 @@
+ subdirs-y := callbacks crossystem nvdata stages ui util
+ 
+ depthcharge-y += stages.c
++depthcharge-y += unlock.c
+ depthcharge-y += boot_policy.c
+ depthcharge-y += firmware_id.c
+ depthcharge-y += nvdata.c
+diff --git a/src/vboot/unlock.c b/src/vboot/unlock.c
+new file mode 100644
+index 0000000..93df37b
+--- /dev/null
++++ b/src/vboot/unlock.c
+@@ -0,0 +1,443 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Firmware unlock: take the disk keys out of the Cr50 and hand them to the
++ * kernel, so root and home can be encrypted with no initramfs.
++ *
++ * The keys live in an NV index whose policy is PolicyPCR over PCR0 (boot
++ * mode), PCR1 (HWID) and PCR12, followed by PolicyAuthValue. That combination
++ * is what makes the release conditional: the index opens only in normal mode,
++ * on this machine, before PCR12 has been capped, and only to someone who knows
++ * the PIN. Developer mode, recovery mode, another board or a booted OS all
++ * present different PCRs and get nothing.
++ *
++ * The PIN is never sent to the TPM. It is hashed into the index's authValue
++ * and used as an HMAC key, so what crosses the bus is a proof rather than a
++ * secret. The reply is HMACed too and checked here, so the keys cannot be
++ * substituted by anything else that reaches the SPI lines.
++ *
++ * The reply is not encrypted, though. The session uses no parameter
++ * encryption, so the key block itself crosses the bus in the clear, and a
++ * probe on the TPM's SPI lines during an unlock can record it.
++ *
++ * PCR12 is extended before we hand over, on every path including failure. The
++ * kernel therefore starts with the index already unreadable, and no amount of
++ * root on the running system gets a second look at it until the next boot.
++ *
++ * The handover block is the same layout the kernel already uses for its kdump
++ * dm-crypt keys (struct keys_header / struct dm_crypt_key), so the kernel side
++ * stays close to code that is already upstream.
++ */
++
++#include <endian.h>
++#include <libpayload.h>
++#include <stdint.h>
++#include <string.h>
++#include <vb2_api.h>
++#include <vboot_api.h>
++
++#include "base/device_tree.h"
++#include "drivers/video/display.h"
++#include "base/list.h"
++#include "vboot/ui.h"
++#include "vboot/unlock.h"
++#include "vboot/util/memory.h"
++#include "tlcl.h"
++
++/*
++ * Matches struct dm_crypt_key in the kernel's kernel/crash_dump_dm_crypt.c and
++ * the copy of it in drivers/md/dm-boot-keys.c. Keep them in step.
++ */
++#define UNLOCK_KEY_DESC_MAX	128
++#define UNLOCK_KEY_SIZE_MAX	256
++
++struct unlock_key {
++	uint32_t key_size;
++	char key_desc[UNLOCK_KEY_DESC_MAX];
++	uint8_t data[UNLOCK_KEY_SIZE_MAX];
++};
++
++struct unlock_keys_header {
++	uint32_t total_keys;
++	struct unlock_key keys[];
++};
++
++/*
++ * Domain separation: the authValue is a hash of this string and the PIN, not
++ * of the PIN alone, so the same PIN typed into something else does not produce
++ * this machine's authValue. swifty-enroll uses the identical string; if these
++ * ever disagree the unlock fails with nothing to see.
++ */
++#define UNLOCK_DOMAIN		"swifty-unlock-v1"
++
++/* PCR 0, 1 and 12, as a bitmap of PCR index. */
++#define UNLOCK_PCR_BITMAP	((1 << 0) | (1 << 1) | (1 << 12))
++#define UNLOCK_PCR_CAP		12
++
++#define UNLOCK_PIN_MAX		64
++
++/*
++ * One typo should not cost a reboot. This is not rate limiting. The Cr50
++ * ships with dictionary-attack lockout disabled, and the one this was
++ * developed on (RW 0.5.241) did not keep lockout parameters across a reboot,
++ * so the number of guesses is bounded only by how fast the machine can be
++ * restarted. Choose the PIN with that in mind.
++ */
++#define UNLOCK_PIN_TRIES	3
++
++typedef struct {
++	uint64_t start;
++	uint64_t size;
++	DeviceTreeFixup fixup;
++} UnlockKeys;
++
++static UnlockKeys unlock_keys;
++
++/*
++ * Publish the block twice over: as a reserved-memory node so the kernel keeps
++ * its hands off the pages, and as a /chosen property so it knows where to look.
++ * no-map matters -- without it the kernel may map the range cacheably for its
++ * own use and the keys would be read out of a page that has been handed to
++ * something else.
++ */
++static int unlock_dt_fixup(DeviceTreeFixup *fixup, DeviceTree *tree)
++{
++	UnlockKeys *keys = container_of(fixup, UnlockKeys, fixup);
++	DeviceTreeNode *reserved, *node, *chosen;
++	const char *chosen_path[] = { "chosen", NULL };
++	u32 addr_cells = 1, size_cells = 1;
++	u32 *cells;
++
++	if (!keys->size)
++		return 0;
++
++	reserved = dt_init_reserved_memory_node(tree);
++	if (!reserved)
++		return 1;
++	dt_read_cell_props(reserved, &addr_cells, &size_cells);
++
++	node = xzalloc(sizeof(*node));
++	node->name = "dm-boot-keys";
++	list_insert_after(&node->list_node, &reserved->children);
++	dt_add_reg_prop(node, &keys->start, &keys->size, 1,
++			addr_cells, size_cells);
++	dt_add_bin_prop(node, "no-map", NULL, 0);
++
++	chosen = dt_find_node(tree->root, chosen_path, NULL, NULL, 1);
++	if (!chosen)
++		return 1;
++
++	/*
++	 * Four cells: a 64-bit address then a 64-bit length, regardless of
++	 * what the root node's cell counts happen to be. A single u32 would
++	 * have truncated silently the day the block landed above 4 GiB, and
++	 * the kernel side needs the length to know how much to wipe.
++	 */
++	cells = xmalloc(sizeof(*cells) * 4);
++	cells[0] = htobel((u32)(keys->start >> 32));
++	cells[1] = htobel((u32)keys->start);
++	cells[2] = htobel((u32)(keys->size >> 32));
++	cells[3] = htobel((u32)keys->size);
++	dt_add_bin_prop(chosen, "linux,dm-boot-keys", cells,
++			sizeof(*cells) * 4);
++
++	return 0;
++}
++
++/*
++ * Reserve a page for the block. It is deliberately not on the heap: the heap
++ * is handed back to the kernel as ordinary memory, and these bytes have to
++ * survive until the kernel has copied them out and wiped them.
++ */
++static struct unlock_keys_header *unlock_alloc_block(size_t size)
++{
++	void *block;
++
++	size = ALIGN_UP(size, 4096);
++	block = memalign(4096, size);
++	if (!block)
++		return NULL;
++	memset(block, 0, size);
++
++	unlock_keys.start = (uintptr_t)block;
++	unlock_keys.size = size;
++	unlock_keys.fixup.fixup = &unlock_dt_fixup;
++	list_insert_after(&unlock_keys.fixup.list_node, &device_tree_fixups);
++	memory_mark_used(unlock_keys.start, unlock_keys.start + size);
++
++	return block;
++}
++
++/* authValue = SHA256(domain || pin). The digest gives the HMAC a full-length
++ * key whatever the PIN's length, but it adds no entropy: a short PIN is as
++ * guessable as it looks. See UNLOCK_PIN_TRIES. */
++static vb2_error_t unlock_auth_value(const char *pin, uint8_t *out)
++{
++	uint8_t buf[sizeof(UNLOCK_DOMAIN) - 1 + UNLOCK_PIN_MAX];
++	size_t pin_len = strnlen(pin, UNLOCK_PIN_MAX);
++	vb2_error_t rv;
++
++	memcpy(buf, UNLOCK_DOMAIN, sizeof(UNLOCK_DOMAIN) - 1);
++	memcpy(buf + sizeof(UNLOCK_DOMAIN) - 1, pin, pin_len);
++	rv = vb2_digest_buffer(buf, sizeof(UNLOCK_DOMAIN) - 1 + pin_len,
++			       VB2_HASH_SHA256, out, VB2_SHA256_DIGEST_SIZE);
++	memset(buf, 0, sizeof(buf));
++
++	return rv;
++}
++
++/*
++ * A real screen, drawn the way depthcharge draws its recovery and developer
++ * screens: bitmaps from the font archive onto the framebuffer coreboot set up.
++ *
++ * printf() is not an option here. depthcharge binds no video console -- it
++ * initialises serial and cbmem and leaves it there, because its own UI draws
++ * rather than prints -- so anything printed reaches the CCD UART and nothing
++ * else. The panel is also dark until somebody asks for it: coreboot turns the
++ * backlight OFF in configure_backlight_and_bridge() and never back on, and
++ * board_backlight_update() in depthcharge is the only thing that raises
++ * GPIO_AP_EDP_BKLTEN again.
++ */
++
++#define UNLOCK_TITLE_H		42
++#define UNLOCK_BODY_H		28
++#define UNLOCK_NOTE_H		22
++#define UNLOCK_TEXT_FLAGS	(PIVOT_H_CENTER | PIVOT_V_TOP)
++
++static int unlock_screen_up;
++
++static void unlock_screen_begin(void)
++{
++	if (display_init()) {
++		printf("unlock: no display; the prompt is on serial only\n");
++		return;
++	}
++	backlight_update(1);
++	enable_graphics_buffer();
++	unlock_screen_up = 1;
++}
++
++/* Redrawn on every keystroke, so the row of dots grows as the PIN is typed. */
++static void unlock_screen_draw(size_t pin_len, const char *note)
++{
++	char mask[UNLOCK_PIN_MAX + 1];
++	int32_t y = UI_SCALE / 4;
++	size_t i;
++
++	if (!unlock_screen_up)
++		return;
++
++	clear_screen(&ui_color_bg);
++
++	ui_draw_text("swifty", UI_SCALE / 2, y, UNLOCK_TITLE_H,
++		     &ui_color_bg, &ui_color_fg, UNLOCK_TEXT_FLAGS, 0);
++	y += UNLOCK_TITLE_H * 2;
++	ui_draw_text("Enter the disk unlock PIN", UI_SCALE / 2, y,
++		     UNLOCK_BODY_H, &ui_color_bg, &ui_color_fg,
++		     UNLOCK_TEXT_FLAGS, 0);
++	y += UNLOCK_BODY_H * 3;
++
++	for (i = 0; i < pin_len && i < sizeof(mask) - 1; i++)
++		mask[i] = '*';
++	mask[i] = '\0';
++	/* Something has to be drawn, or an empty line looks like a hang. */
++	ui_draw_text(i ? mask : "_", UI_SCALE / 2, y, UNLOCK_BODY_H,
++		     &ui_color_bg, &ui_color_fg, UNLOCK_TEXT_FLAGS, 0);
++	y += UNLOCK_BODY_H * 3;
++
++	if (note)
++		ui_draw_text(note, UI_SCALE / 2, y, UNLOCK_NOTE_H,
++			     &ui_color_bg, &ui_color_fg, UNLOCK_TEXT_FLAGS, 0);
++
++	flush_graphics_buffer();
++}
++
++/* Hand the panel back the way it was found, so the kernel starts from a known
++ * state rather than from whatever the last frame happened to be. */
++static void unlock_screen_end(void)
++{
++	if (!unlock_screen_up)
++		return;
++	clear_screen(&ui_color_bg);
++	flush_graphics_buffer();
++	disable_graphics_buffer();
++	unlock_screen_up = 0;
++}
++
++/*
++ * Read the PIN from the internal keyboard only. VB_KEY_FLAG_TRUSTED_KEYBOARD
++ * excludes USB keyboards, which a passer-by can plug in. Note it does admit
++ * the UART, i.e. the CCD debug console: that is ChromeOS's definition, and it
++ * is only reachable with the debug cable attached. A CCD password would close
++ * that; nothing here sets one.
++ */
++static int unlock_prompt_pin(char *pin, size_t pin_max, const char *note)
++{
++	size_t len = 0;
++
++	printf("\nPIN: ");
++	unlock_screen_draw(0, note);
++
++	while (1) {
++		uint32_t flags = 0;
++		uint32_t c = VbExKeyboardReadWithFlags(&flags);
++
++		if (!c)
++			continue;
++		if (!(flags & VB_KEY_FLAG_TRUSTED_KEYBOARD))
++			continue;	/* not the internal keyboard */
++
++		if (c == '\r' || c == '\n') {
++			pin[len] = '\0';
++			printf("\n");
++			return len ? 0 : -1;
++		}
++		if (c == '\b' || c == 0x7f) {
++			if (len)
++				len--;
++			unlock_screen_draw(len, note);
++			continue;
++		}
++		if (c == 0x1b)		/* escape: give up */
++			return -1;
++		if (c < ' ' || c > '~')
++			continue;
++		if (len + 1 >= pin_max)
++			continue;
++		pin[len++] = (char)c;
++		unlock_screen_draw(len, note);
++	}
++}
++
++/* Drive the policy to the value the index was sealed under, then read it. */
++static uint32_t unlock_read_index(uint32_t index, const uint8_t *auth,
++				  void *out, uint32_t length)
++{
++	uint8_t nonce_tpm[VB2_SHA256_DIGEST_SIZE];
++	uint32_t session;
++	uint32_t rv, rv_flush;
++
++	rv = TlclStartAuthSession(&session, nonce_tpm);
++	if (rv != TPM_SUCCESS) {
++		printf("unlock: StartAuthSession failed (0x%x)\n", rv);
++		return rv;
++	}
++
++	/* Name the step that failed. A wrong PIN and a broken exchange both
++	 * end the same way from the outside, and telling them apart without
++	 * this took a firmware build and a flash. */
++	rv = TlclPolicyPCR(session, UNLOCK_PCR_BITMAP);
++	if (rv != TPM_SUCCESS)
++		printf("unlock: PolicyPCR failed (0x%x)\n", rv);
++	if (rv == TPM_SUCCESS) {
++		rv = TlclPolicyAuthValue(session);
++		if (rv != TPM_SUCCESS)
++			printf("unlock: PolicyAuthValue failed (0x%x)\n", rv);
++	}
++	if (rv == TPM_SUCCESS) {
++		rv = TlclReadPolicy(index, out, length, session, nonce_tpm,
++				    auth, VB2_SHA256_DIGEST_SIZE);
++		if (rv != TPM_SUCCESS)
++			printf("unlock: NV_Read failed (0x%x)\n", rv);
++	}
++
++	/* Sessions are a scarce resource in the TPM; never leak one. */
++	rv_flush = TlclFlushContext(session);
++	if (rv == TPM_SUCCESS && rv_flush != TPM_SUCCESS)
++		rv = rv_flush;
++
++	return rv;
++}
++
++/* Cap PCR12 so the booted system cannot read the index again. Runs on every
++ * path, including the ones where the unlock failed: a machine that gave up on
++ * the PIN must not hand the next stage a still-open door. */
++static void unlock_cap_pcr(void)
++{
++	uint8_t digest[VB2_SHA256_DIGEST_SIZE];
++	uint8_t out[VB2_SHA256_DIGEST_SIZE];
++	const char marker[] = "swifty-unlock-done";
++
++	if (vb2_digest_buffer((const uint8_t *)marker, sizeof(marker) - 1,
++			      VB2_HASH_SHA256, digest, sizeof(digest)))
++		memset(digest, 0xff, sizeof(digest));
++
++	if (TlclExtend(UNLOCK_PCR_CAP, digest, out) != TPM_SUCCESS)
++		printf("unlock: WARNING: could not cap PCR%d\n",
++		       UNLOCK_PCR_CAP);
++}
++
++/*
++ * Returns 0 when the keys were published. A non-zero return is not fatal on
++ * its own: the caller decides, and an unencrypted volume still boots.
++ */
++int unlock_disk_keys(uint32_t index, uint32_t key_count)
++{
++	struct unlock_keys_header *block;
++	char pin[UNLOCK_PIN_MAX];
++	uint8_t auth[VB2_SHA256_DIGEST_SIZE];
++	size_t size;
++	uint32_t rv;
++	const char *note = NULL;
++	int tries;
++	int ret = -1;
++
++	size = sizeof(*block) + key_count * sizeof(struct unlock_key);
++	block = unlock_alloc_block(size);
++	if (!block) {
++		printf("unlock: no memory for the key block\n");
++		unlock_cap_pcr();
++		return -1;
++	}
++
++	unlock_screen_begin();
++	printf("\nswifty: unlock the disk.\n");
++
++	for (tries = UNLOCK_PIN_TRIES; tries > 0; tries--) {
++		if (tries < UNLOCK_PIN_TRIES)
++			note = "That PIN was not accepted. Try again.";
++		if (unlock_prompt_pin(pin, sizeof(pin), note)) {
++			/* Escape, or an empty line: the person at the keyboard
++			 * has said no, so stop asking. */
++			printf("unlock: no PIN entered\n");
++			break;
++		}
++
++		if (unlock_auth_value(pin, auth)) {
++			printf("unlock: could not derive the auth value\n");
++			break;
++		}
++
++		rv = unlock_read_index(index, auth, block, size);
++		memset(pin, 0, sizeof(pin));
++		memset(auth, 0, sizeof(auth));
++
++		if (rv == TPM_SUCCESS) {
++			ret = 0;
++			break;
++		}
++
++		/* Deliberately vague: a wrong PIN and a wrong machine should
++		 * look the same from the outside. */
++		printf("unlock: the TPM did not release the keys (0x%x), "
++		       "%d left\n", rv, tries - 1);
++	}
++
++	if (!ret && (block->total_keys == 0 || block->total_keys > key_count)) {
++		printf("unlock: key block says %u keys\n", block->total_keys);
++		ret = -1;
++	}
++
++	if (!ret)
++		printf("unlock: %u key(s) handed to the kernel\n",
++		       block->total_keys);
++
++	/* The PIN and the auth value have no business outliving this call. */
++	memset(pin, 0, sizeof(pin));
++	memset(auth, 0, sizeof(auth));
++	if (ret)
++		memset(block, 0, size);
++	unlock_screen_end();
++	unlock_cap_pcr();
++
++	return ret;
++}
+diff --git a/src/vboot/unlock.h b/src/vboot/unlock.h
+new file mode 100644
+index 0000000..9014073
+--- /dev/null
++++ b/src/vboot/unlock.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Firmware unlock: the disk keys, out of the Cr50 and into the kernel.
++ * See src/vboot/unlock.c.
++ */
++
++#ifndef __VBOOT_UNLOCK_H__
++#define __VBOOT_UNLOCK_H__
++
++#include <stdint.h>
++
++/*
++ * The NV index the keys live in, and how many of them it holds. Both are
++ * fixed here rather than discovered: swifty-enroll defines the index at
++ * exactly the size this key count implies, and a firmware that disagreed
++ * with it would fail the read with nothing useful to say.
++ *
++ * Note the form. tpm2-tools and swifty-enroll name this index 0x01500001,
++ * with the TPM_HT_NV_INDEX byte on the front. vboot's TLCL takes the BARE
++ * index and adds that byte itself, as every other Tcl* call in it does, so
++ * the bare number is what belongs here. Writing the full handle asks the TPM
++ * for 0x02500001, which it refuses with TPM_RC_VALUE.
++ */
++#define UNLOCK_NV_INDEX		0x00500001
++#define UNLOCK_NV_KEY_COUNT	2
++
++/*
++ * Ask for the PIN, read the keys, publish them for the kernel, and cap PCR12.
++ * Returns 0 when the keys were published. A non-zero return is not fatal on
++ * its own -- the caller decides -- and PCR12 is capped either way.
++ */
++int unlock_disk_keys(uint32_t index, uint32_t key_count);
++
++#endif /* __VBOOT_UNLOCK_H__ */

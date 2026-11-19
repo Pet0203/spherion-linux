@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pet0203 <Pet0203@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:00:00 +0000
+Subject: [PATCH] vboot: run the disk unlock when the kernel command line asks
+ for it
+
+Call the unlock from vboot_boot_kernel() when the selected kernel's command
+line contains "dm-mod.create=".
+
+dm-mod.create= is how a root device gets mapped without an initramfs, and a
+command line that has it belongs to a kernel that will go looking for
+":64:logon:" keys only the firmware can supply. The command line is inside
+the signed kernel partition, so what decides whether a PIN is asked for is
+covered by the same signature as the kernel itself: nothing on the disk,
+and nobody at the keyboard, can turn the prompt on or off.
+
+It also means the unlock is inert until such a kernel is installed. A
+kernel that says nothing about dm (a rescue image, for instance) boots as
+before, with no prompt and with PCR12 left alone.
+
+Developer and recovery mode are excluded. PCR0 differs in both, so the TPM
+would refuse the read whatever was typed, and a prompt there could only
+collect a PIN it cannot use.
+
+A failed unlock does not stop the boot. The kernel then fails to map root
+and says so, which is a better place to find out than a firmware that
+refuses to go on. Use rootwait=<seconds> and panic=<seconds> on the command
+line so that this ends in a reboot rather than a kernel waiting forever on
+a blank screen.
+---
+ src/vboot/stages.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/vboot/stages.c b/src/vboot/stages.c
+index 83cf89c..2a664fa 100644
+--- a/src/vboot/stages.c
++++ b/src/vboot/stages.c
+@@ -38,6 +38,7 @@
+ #include "vboot/nvdata.h"
+ #include "vboot/secdata_tpm.h"
+ #include "vboot/stages.h"
++#include "vboot/unlock.h"
+ #include "vboot/util/commonparams.h"
+ #include "vboot/util/flag.h"
+ #include "vboot/util/memory.h"
+@@ -226,6 +227,25 @@ void vboot_boot_kernel(VbSelectAndLoadKernelParams *kparams)
+ 		bi.cmd_line = cmd_line_buf;
+ 	}
+ 
++	/*
++	 * A kernel that maps its root through dm needs the volume keys, and
++	 * only the firmware can get them out of the Cr50. Ask for the PIN and
++	 * hand them over. A kernel that says nothing about dm -- a rescue
++	 * image, or anything from before the disk was encrypted -- is
++	 * booted exactly as before, with no prompt.
++	 *
++	 * Not in developer or recovery mode: PCR0 differs there, so the TPM
++	 * would refuse the read whatever was typed, and all a prompt could do
++	 * is take a PIN it cannot use.
++	 *
++	 * The return value is deliberately ignored. If the keys did not come
++	 * out, the kernel fails to map root and says so, which is a better
++	 * place to find out than a firmware that refuses to boot at all.
++	 */
++	if (bi.cmd_line && strstr(bi.cmd_line, "dm-mod.create=") &&
++	    !vboot_in_developer() && !vboot_in_recovery())
++		unlock_disk_keys(UNLOCK_NV_INDEX, UNLOCK_NV_KEY_COUNT);
++
+ 	if (crossystem_setup(FIRMWARE_TYPE_AUTO_DETECT))
+ 		return;
+ 

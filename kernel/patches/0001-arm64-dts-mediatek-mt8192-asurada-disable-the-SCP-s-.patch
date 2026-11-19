@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pet0203 <Pet0203@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:00:00 +0000
+Subject: [PATCH] arm64: dts: mediatek: mt8192-asurada: disable the SCP's
+ cros-ec-rpmsg node
+
+On google,spherion a mainline kernel hung on resume from suspend-to-RAM.
+Two changes together made that go away; this is one of them, and the other
+is "spi: mtk-nor: re-initialise the controller in runtime resume".
+
+The node disabled here makes the SCP firmware's cros-ec interface appear as
+a second ChromeOS EC device, reached over rpmsg. The machine's real embedded
+controller sits on SPI (&spi1) and is untouched: keyboard, battery, charger,
+USB-C policy and the EC's side of the suspend handshake keep working.
+
+This is an empirical fix. Why the rpmsg instance upsets suspend/resume has
+not been root-caused, and what else depends on the node was not
+investigated: SCP-backed features such as the hardware video codecs were
+not tested with or without it.
+---
+ arch/arm64/boot/dts/mediatek/mt8192-asurada.dtsi | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt8192-asurada.dtsi b/arch/arm64/boot/dts/mediatek/mt8192-asurada.dtsi
+index 40d34b16d..0f4b95a67 100644
+--- a/arch/arm64/boot/dts/mediatek/mt8192-asurada.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt8192-asurada.dtsi
+@@ -1386,6 +1386,12 @@
+ 	cros-ec-rpmsg {
+ 		compatible = "google,cros-ec-rpmsg";
+ 		mediatek,rpmsg-name = "cros-ec-rpmsg";
++		/*
++		 * The SCP's cros-ec interface. With it enabled, resume from
++		 * suspend-to-RAM hangs; the embedded controller proper is on
++		 * SPI (&spi1) and does not depend on it.
++		 */
++		status = "disabled";
+ 	};
+ };
+ 

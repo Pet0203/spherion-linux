@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pet0203 <Pet0203@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:00:00 +0000
+Subject: [PATCH] mb/google/asurada: always bring the display up
+
+Stock ChromeOS firmware initialises the display only when vboot asks for
+it: recovery, developer mode, a diagnostics request, or the one-shot
+VB2_NV_DISPLAY_REQUEST bit. A normal-mode boot asks for none of those, so
+there is no panel and no framebuffer by the time the payload runs.
+
+A firmware that prompts for a disk unlock PIN on every normal boot needs
+one. depthcharge cannot make up for it: this board registers no DisplayOps,
+so its display_init() prints "called but not implemented" and returns, and
+a prompt drawn on a panel that was never powered looks exactly like a
+machine that has died.
+
+Call configure_display() unconditionally. It has to be done here rather
+than by changing what vboot reports: that flag is decided in verstage,
+which lives in the RO section behind the hardware write-protect, while
+ramstage is in the RW section and can be replaced by an ordinary RW update.
+
+Checked on spherion before writing this: setting VB2_NV_DISPLAY_REQUEST by
+hand for a single boot (crossystem display_request=1) made coreboot log
+"configure_display: Starting display init" and bring up the panel at
+1920x1080. With this patch the same happens on every boot, with that bit
+clear.
+
+Cost: every normal boot pays for panel bring-up, whether or not anything
+is drawn.
+---
+ src/mainboard/google/asurada/mainboard.c | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/src/mainboard/google/asurada/mainboard.c b/src/mainboard/google/asurada/mainboard.c
+index 7704899f..bd988500 100644
+--- a/src/mainboard/google/asurada/mainboard.c
++++ b/src/mainboard/google/asurada/mainboard.c
+@@ -235,10 +235,19 @@ static void mainboard_init(struct device *dev)
+ 	if (spm_init())
+ 		printk(BIOS_ERR, "spm init fail, system suspend may stuck\n");
+ 
+-	if (display_init_required())
+-		configure_display();
+-	else
+-		printk(BIOS_INFO, "%s: Skipped display init\n", __func__);
++	/*
++	 * Unconditionally, not only when vboot asks for it. This firmware
++	 * prompts for a disk unlock PIN on every normal boot, and a prompt
++	 * drawn on a panel that was never powered is indistinguishable from a
++	 * machine that has died.
++	 *
++	 * The flag this used to test is decided in verstage, which lives in
++	 * the RO section behind the hardware write-protect, so it cannot be
++	 * changed without unprotecting the chip. ramstage is in the RW section
++	 * we sign and flash, so this is where the decision can still be made.
++	 */
++	if (!configure_display())
++		printk(BIOS_ERR, "%s: display init failed\n", __func__);
+ }
+ 
+ static void mainboard_enable(struct device *dev)

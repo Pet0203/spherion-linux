@@ -1,0 +1,49 @@
+# Kernel command line for build-kpart.sh, as used on the development machine
+# with the partition identifiers replaced. Lines starting with # and blank
+# lines are ignored; the rest is joined with spaces. build-kpart.sh prepends
+# "kern_guid=%U", which depthcharge replaces with the GUID of the partition it
+# booted.
+#
+# The command line is part of the signed kernel partition. With the patched
+# depthcharge, the presence of dm-mod.create= on it is also what makes the
+# firmware ask for the disk unlock PIN.
+
+# The serial console (the debug UART) gets the kernel log; the panel is left to
+# the boot splash and the compositor. Add console=tty1 while debugging.
+quiet splash console=ttyS0,115200n8
+
+# rootwait with no value waits for the root device forever and never panics.
+# After a refused PIN that means a live kernel on a blank screen (no display
+# driver is loaded that early) until someone holds the power button. With a
+# bound it panics, and panic=<seconds> reboots. rootwait=<seconds> needs
+# Linux 6.7 or newer.
+rootwait=60 ro rootfstype=ext4 panic=20
+
+# What suspend-to-RAM was tested with. Which of these are strictly needed has
+# not been isolated.
+fw_devlink=rpm driver_async_probe=none deferred_probe_timeout=2 noresume
+
+# Root is the dm device, by its fixed minor: the table below pins "croot" to
+# minor 0, so /dev/dm-0 does not depend on creation order, and the kernel
+# mounts it by that name without needing udev.
+root=/dev/dm-0
+
+# One table entry per volume, separated by ";". Copy each table from what
+# cryptsetup itself programs for the volume ("dmsetup table" after
+# "cryptsetup open") and replace the key field; do not write it by hand. The
+# trailing "1 sector_size:4096" exists only for volumes created with
+# --sector-size 4096, and leaving it out when it is needed corrupts every read.
+#
+#   <name>,<uuid>,<minor>,<flags>,<start> <sectors> crypt <cipher> <key> <iv_offset> <device> <data offset> [options]
+#
+# The key field ":64:logon:swifty:root" names a 64-byte key of type "logon" in
+# the kernel keyring, with the description that was given to swifty-enroll, so
+# nothing secret appears here or in /proc/cmdline. "rw" here is about the
+# device, not the mount: "ro" above is what makes the initial mount read-only.
+dm-mod.create="croot,,0,rw,0 <ROOT-SECTORS> crypt aes-xts-plain64 :64:logon:swifty:root 0 PARTUUID=<ROOT-PARTUUID> 32768 1 sector_size:4096;chome,,1,rw,0 <HOME-SECTORS> crypt aes-xts-plain64 :64:logon:swifty:home 0 PARTUUID=<HOME-PARTUUID> 32768 1 sector_size:4096"
+
+# dm_init_init() is a late_initcall, and its wait_for_device_probe() does not
+# cover MMC card detection, which finishes later in a workqueue. Without this,
+# dm-init gives up with "crypt: Device lookup failed (-ENODEV)" some tens of
+# milliseconds before the eMMC's partitions appear.
+dm-mod.waitfor=PARTUUID=<ROOT-PARTUUID>,PARTUUID=<HOME-PARTUUID>

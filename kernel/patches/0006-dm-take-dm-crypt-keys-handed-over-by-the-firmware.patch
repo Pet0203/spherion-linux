@@ -1,0 +1,435 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pet0203 <Pet0203@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:00:00 +0000
+Subject: [PATCH] dm: take dm-crypt keys handed over by the firmware
+
+A machine whose root is encrypted and which has no initramfs has a
+chicken-and-egg problem: the volume key has to be known before there is
+any filesystem to read it from. dm-mod.create= can carry the key inline,
+but the command line is world-readable through /proc/cmdline, so that
+turns an encrypted root into a decorative one.
+
+Let the bootloader supply it instead. The bootloader (a patched depthcharge,
+in this repository) releases the keys from the TPM after a PIN, leaves them
+in a page it reserves with no-map, and names that page in /chosen as
+"linux,dm-boot-keys": four cells, a 64-bit address then a 64-bit length.
+The early flat-tree scan picks the address up and blanks the property, so
+nothing downstream, /sys/firmware/fdt included, ever sees it.
+
+drivers/md/dm-boot-keys.c then installs each key as a "logon" key, which
+has no read method, so the table can say ":64:logon:swifty:root" and
+nothing, root included, can read the key back out of the keyring.
+
+The ordering is the whole trick. The install is a device_initcall, level
+6; dm_init_init(), which parses dm-mod.create= and asks for the keys, is
+a late_initcall, level 7. Both run in the same thread with init_cred,
+which subscribes to no keyring of its own, so request_key() falls back
+to root's user-session keyring, which is where the keys are put, and
+possessed, so possessor permissions alone are enough. The revoke is a
+late_initcall_sync, level 7s, which runs after every late_initcall: by
+then dm-crypt holds its own copy (cc->key_string is kept only so that
+"dmsetup table" can print the key description instead of the key), and
+userspace has not started yet.
+
+The firmware's page is wiped as soon as it has been copied, and the copy
+is freed with kfree_sensitive(). If the page turns out not to be reserved
+after all, it belongs to somebody else by now and is left alone rather
+than wiped.
+
+The block layout is the one kernel/crash_dump_dm_crypt.c already uses for
+kdump, so both ends of this stay close to code that is already upstream.
+
+Not a secret from root: "dmsetup table --showkeys" prints any dm-crypt
+volume key, as it does on every system. What this keeps the key out of is
+the command line, the device tree and the keyrings userspace inherits.
+---
+ drivers/md/Kconfig           |  15 +++
+ drivers/md/Makefile          |   1 +
+ drivers/md/dm-boot-keys.c    | 246 +++++++++++++++++++++++++++++++++++
+ drivers/of/fdt.c             |  42 ++++++
+ include/linux/dm-boot-keys.h |  18 +++
+ 5 files changed, 322 insertions(+)
+ create mode 100644 drivers/md/dm-boot-keys.c
+ create mode 100644 include/linux/dm-boot-keys.h
+
+diff --git a/drivers/md/Kconfig b/drivers/md/Kconfig
+index df27c7d06..9424cd02f 100644
+--- a/drivers/md/Kconfig
++++ b/drivers/md/Kconfig
+@@ -543,6 +543,21 @@ config DM_INIT
+ 
+ 	If unsure, say N.
+ 
++config DM_BOOT_KEYS
++	bool "Take dm-crypt keys from the firmware"
++	depends on DM_CRYPT=y
++	depends on KEYS
++	depends on OF_EARLY_FLATTREE
++	help
++	Install dm-crypt keys handed over by the bootloader in a reserved
++	page named by the "linux,dm-boot-keys" property of /chosen, as
++	"logon" keys, before dm-mod.create= is parsed. This lets an
++	encrypted root be opened with no initramfs and without the volume
++	key appearing on the kernel command line. The keys are revoked
++	before userspace starts.
++
++	Useless unless the firmware in use does this. If unsure, say N.
++
+ config DM_UEVENT
+ 	bool "DM uevents"
+ 	depends on BLK_DEV_DM
+diff --git a/drivers/md/Makefile b/drivers/md/Makefile
+index 517d1f7d8..d90d04a1d 100644
+--- a/drivers/md/Makefile
++++ b/drivers/md/Makefile
+@@ -85,6 +85,7 @@ obj-$(CONFIG_DM_INTEGRITY)	+= dm-integrity.o
+ obj-$(CONFIG_DM_ZONED)		+= dm-zoned.o
+ obj-$(CONFIG_DM_WRITECACHE)	+= dm-writecache.o
+ obj-$(CONFIG_SECURITY_LOADPIN_VERITY)	+= dm-verity-loadpin.o
++obj-$(CONFIG_DM_BOOT_KEYS)	+= dm-boot-keys.o
+ 
+ ifeq ($(CONFIG_DM_INIT),y)
+ dm-mod-objs			+= dm-init.o
+diff --git a/drivers/md/dm-boot-keys.c b/drivers/md/dm-boot-keys.c
+new file mode 100644
+index 000000000..953491434
+--- /dev/null
++++ b/drivers/md/dm-boot-keys.c
+@@ -0,0 +1,246 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * dm-boot-keys - install dm-crypt keys handed over by the firmware.
++ *
++ * On a machine whose root is encrypted and which has no initramfs, something
++ * has to know the volume key before there is any filesystem to read it from.
++ * Here the bootloader does: it unseals the keys from the TPM after a PIN and
++ * leaves them in a page it has reserved for us, named in /chosen as
++ * "linux,dm-boot-keys" and reserved as a /reserved-memory node with no-map.
++ *
++ * Each key is installed as a "logon" key, so the dm-mod.create= table on the
++ * command line can name it -- ":64:logon:swifty:root" -- rather than carry the
++ * key itself, which /proc/cmdline would then publish to every process on the
++ * machine. A logon key has no read method, so not even root can read one back
++ * out of the keyring.
++ *
++ * Ordering. The install is a device_initcall (level 6) and dm_init_init(),
++ * which parses dm-mod.create= and asks for the keys, is a late_initcall
++ * (level 7), so the keys are always in place before anything looks for them.
++ * The revoke is a late_initcall_sync (level 7s), which runs after every
++ * late_initcall: by then dm-crypt has copied the key into its own target
++ * context and nothing else has any use for it. Userspace has not started.
++ *
++ * The block layout is the one the kdump dm-crypt code already uses
++ * (struct keys_header / struct dm_crypt_key in kernel/crash_dump_dm_crypt.c),
++ * so both ends of this stay close to code that is already upstream.
++ */
++
++#define pr_fmt(fmt) "dm-boot-keys: " fmt
++
++#include <linux/dm-boot-keys.h>
++#include <linux/err.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/key.h>
++#include <linux/keyctl.h>
++#include <linux/memblock.h>
++#include <linux/overflow.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++/* Matches the firmware. Keep both ends in step. */
++#define DM_BOOT_KEY_NUM_MAX	16
++#define DM_BOOT_KEY_SIZE_MAX	256
++#define DM_BOOT_KEY_DESC_MAX	128
++
++/* Nothing sane needs a bigger handover than this, and refusing to map a
++ * silly size is cheaper than finding out why later. */
++#define DM_BOOT_KEYS_SIZE_MAX	SZ_1M
++
++struct dm_boot_key {
++	u32 key_size;
++	char key_desc[DM_BOOT_KEY_DESC_MAX];
++	u8 data[DM_BOOT_KEY_SIZE_MAX];
++};
++
++struct dm_boot_keys_header {
++	u32 total_keys;
++	struct dm_boot_key keys[];
++};
++
++static u64 dm_boot_keys_base __initdata;
++static u64 dm_boot_keys_size __initdata;
++
++static struct key *dm_boot_keys[DM_BOOT_KEY_NUM_MAX] __initdata;
++static unsigned int dm_boot_nr_keys __initdata;
++
++/*
++ * Called from the early flat-device-tree scan, long before this file's
++ * initcalls run. Nothing is touched here but two numbers: the memory the
++ * numbers point at is not mapped yet.
++ */
++void __init dm_boot_keys_set_region(u64 base, u64 size)
++{
++	dm_boot_keys_base = base;
++	dm_boot_keys_size = size;
++}
++
++static int __init dm_boot_key_install(const struct dm_boot_key *bkey,
++				      key_ref_t keyring_ref)
++{
++	char desc[DM_BOOT_KEY_DESC_MAX];
++	key_ref_t key_ref;
++
++	if (!bkey->key_size || bkey->key_size > DM_BOOT_KEY_SIZE_MAX) {
++		pr_warn("a key claims to be %u bytes, skipped\n",
++			bkey->key_size);
++		return -EINVAL;
++	}
++
++	/* The firmware is not obliged to have terminated the string. */
++	memcpy(desc, bkey->key_desc, sizeof(desc));
++	desc[sizeof(desc) - 1] = '\0';
++	if (!desc[0]) {
++		pr_warn("a key has no description, skipped\n");
++		return -EINVAL;
++	}
++
++	/*
++	 * Possessor permissions only. dm-crypt's request_key() reaches these
++	 * through the user-session keyring, so it possesses them; anything
++	 * that merely runs as root does not, and a logon key cannot be read
++	 * back in any case.
++	 */
++	key_ref = key_create_or_update(keyring_ref, "logon", desc,
++				       bkey->data, bkey->key_size,
++				       KEY_POS_VIEW | KEY_POS_SEARCH,
++				       KEY_ALLOC_NOT_IN_QUOTA);
++	if (IS_ERR(key_ref)) {
++		pr_warn("could not install \"%s\": %ld\n",
++			desc, PTR_ERR(key_ref));
++		return PTR_ERR(key_ref);
++	}
++
++	pr_info("installed logon key \"%s\", %u bytes\n", desc, bkey->key_size);
++
++	/* Hold the reference so the key can be revoked once dm has it. */
++	dm_boot_keys[dm_boot_nr_keys++] = key_ref_to_ptr(key_ref);
++	return 0;
++}
++
++static int __init dm_boot_keys_init(void)
++{
++	struct dm_boot_keys_header *block = NULL;
++	const struct dm_boot_keys_header *hdr;
++	key_ref_t keyring_ref;
++	size_t need;
++	void *map;
++	u32 total;
++	u32 i;
++
++	if (!dm_boot_keys_base || !dm_boot_keys_size)
++		return 0;
++
++	if (dm_boot_keys_size > DM_BOOT_KEYS_SIZE_MAX) {
++		pr_warn("handover block at 0x%llx claims %llu bytes, ignored\n",
++			dm_boot_keys_base, dm_boot_keys_size);
++		return 0;
++	}
++
++	/*
++	 * The firmware reserves the block with no-map, so it is not part of
++	 * the linear map. If it is ordinary memory then the reservation did
++	 * not happen, the page now belongs to somebody else, and wiping it
++	 * would be destroying someone's data.
++	 */
++	if (memblock_is_map_memory(dm_boot_keys_base)) {
++		pr_warn("handover block at 0x%llx is not reserved, ignored\n",
++			dm_boot_keys_base);
++		return 0;
++	}
++
++	map = memremap(dm_boot_keys_base, dm_boot_keys_size, MEMREMAP_WB);
++	if (!map) {
++		pr_err("cannot map the handover block at 0x%llx\n",
++		       dm_boot_keys_base);
++		return 0;
++	}
++	hdr = map;
++
++	total = hdr->total_keys;
++	if (!total) {
++		/* The firmware ran, and handed over nothing. That is what a
++		 * refused PIN looks like from here; it is not an error. */
++		pr_info("the firmware handed over no keys\n");
++		goto wipe;
++	}
++	if (total > DM_BOOT_KEY_NUM_MAX) {
++		pr_warn("handover block claims %u keys, ignored\n", total);
++		goto wipe;
++	}
++
++	need = struct_size(hdr, keys, total);
++	if (need > dm_boot_keys_size) {
++		pr_warn("handover block claims %u keys but holds %llu bytes\n",
++			total, dm_boot_keys_size);
++		goto wipe;
++	}
++
++	block = kmemdup(hdr, need, GFP_KERNEL);
++	if (!block) {
++		pr_err("out of memory for %zu bytes of keys\n", need);
++		goto wipe;
++	}
++
++wipe:
++	/*
++	 * Whatever happened above, the firmware's copy stops existing here:
++	 * this is the only window in which the keys sit in memory that
++	 * nothing has claimed and nothing will clear.
++	 */
++	memzero_explicit(map, dm_boot_keys_size);
++	memunmap(map);
++
++	if (!block)
++		return 0;
++
++	/*
++	 * The user-session keyring is where request_key() from a kernel thread
++	 * ends up: an initcall runs with init_cred, which subscribes to no
++	 * keyring of its own, so the search falls back to root's. dm_init_init()
++	 * runs in this same thread, so it will find what we put here.
++	 */
++	keyring_ref = lookup_user_key(KEY_SPEC_USER_SESSION_KEYRING,
++				      KEY_LOOKUP_CREATE, KEY_NEED_WRITE);
++	if (IS_ERR(keyring_ref)) {
++		pr_err("no writable user-session keyring: %ld\n",
++		       PTR_ERR(keyring_ref));
++		goto out;
++	}
++
++	for (i = 0; i < block->total_keys; i++)
++		dm_boot_key_install(&block->keys[i], keyring_ref);
++
++	key_ref_put(keyring_ref);
++out:
++	kfree_sensitive(block);
++	return 0;
++}
++device_initcall(dm_boot_keys_init);
++
++/*
++ * dm-crypt copies the key into its target context when the table is loaded,
++ * and never looks at the keyring again -- cc->key_string is kept only so that
++ * "dmsetup table" can print ":64:logon:..." instead of the key. So once every
++ * late_initcall has run there is nothing left that wants these, and leaving
++ * them in a keyring userspace inherits would be a gift to nobody.
++ */
++static int __init dm_boot_keys_drop(void)
++{
++	unsigned int i;
++
++	for (i = 0; i < dm_boot_nr_keys; i++) {
++		key_revoke(dm_boot_keys[i]);
++		key_invalidate(dm_boot_keys[i]);
++		key_put(dm_boot_keys[i]);
++		dm_boot_keys[i] = NULL;
++	}
++
++	if (dm_boot_nr_keys)
++		pr_info("revoked %u handover key(s)\n", dm_boot_nr_keys);
++	dm_boot_nr_keys = 0;
++	return 0;
++}
++late_initcall_sync(dm_boot_keys_drop);
+diff --git a/drivers/of/fdt.c b/drivers/of/fdt.c
+index a64afc3de..24fc39c0f 100644
+--- a/drivers/of/fdt.c
++++ b/drivers/of/fdt.c
+@@ -10,6 +10,7 @@
+ 
+ #include <linux/crash_dump.h>
+ #include <linux/crc32.h>
++#include <linux/dm-boot-keys.h>
+ #include <linux/kernel.h>
+ #include <linux/initrd.h>
+ #include <linux/memblock.h>
+@@ -873,6 +874,46 @@ static void __init early_init_dt_check_for_dmcryptkeys(unsigned long node)
+ 	fdt_delprop(initial_boot_params, node, prop_name);
+ }
+ 
++/*
++ * The firmware can hand the kernel the dm-crypt keys for an encrypted root,
++ * in a page it has reserved with no-map, so that root can be opened with no
++ * initramfs. /chosen tells us where: four cells, a 64-bit address followed by
++ * a 64-bit length. drivers/md/dm-boot-keys.c does the rest, much later.
++ */
++static void __init early_init_dt_check_for_dm_boot_keys(unsigned long node)
++{
++	const char *prop_name = "linux,dm-boot-keys";
++	const __be32 *prop;
++	u64 base, size;
++	int len;
++
++	if (!IS_ENABLED(CONFIG_DM_BOOT_KEYS))
++		return;
++
++	prop = of_get_flat_dt_prop(node, prop_name, &len);
++	if (!prop)
++		return;
++	if (len != 4 * (int)sizeof(__be32)) {
++		pr_warn("%s is %d bytes, expected %d\n",
++			prop_name, len, 4 * (int)sizeof(__be32));
++		return;
++	}
++
++	base = ((u64)be32_to_cpu(prop[0]) << 32) | be32_to_cpu(prop[1]);
++	size = ((u64)be32_to_cpu(prop[2]) << 32) | be32_to_cpu(prop[3]);
++	dm_boot_keys_set_region(base, size);
++
++	/*
++	 * Nothing after this point has any use for the address, and a
++	 * property left here would be handed to userspace through
++	 * /sys/firmware/fdt and /sys/firmware/devicetree. Blank it, and fix
++	 * up the CRC the sysfs copy is checked against.
++	 */
++	fdt_nop_property(initial_boot_params, node, prop_name);
++	of_fdt_crc32 = crc32_be(~0, initial_boot_params,
++				fdt_totalsize(initial_boot_params));
++}
++
+ static unsigned long chosen_node_offset = -FDT_ERR_NOTFOUND;
+ 
+ /*
+@@ -1107,6 +1148,7 @@ int __init early_init_dt_scan_chosen(char *cmdline)
+ 	early_init_dt_check_for_initrd(node);
+ 	early_init_dt_check_for_elfcorehdr(node);
+ 	early_init_dt_check_for_dmcryptkeys(node);
++	early_init_dt_check_for_dm_boot_keys(node);
+ 
+ 	rng_seed = of_get_flat_dt_prop(node, "rng-seed", &l);
+ 	if (rng_seed && l > 0) {
+diff --git a/include/linux/dm-boot-keys.h b/include/linux/dm-boot-keys.h
+new file mode 100644
+index 000000000..f781b3a88
+--- /dev/null
++++ b/include/linux/dm-boot-keys.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Keys handed to the kernel by the firmware, for a dm-crypt root with no
++ * initramfs. See drivers/md/dm-boot-keys.c.
++ */
++#ifndef _LINUX_DM_BOOT_KEYS_H
++#define _LINUX_DM_BOOT_KEYS_H
++
++#include <linux/init.h>
++#include <linux/types.h>
++
++#ifdef CONFIG_DM_BOOT_KEYS
++void __init dm_boot_keys_set_region(u64 base, u64 size);
++#else
++static inline void dm_boot_keys_set_region(u64 base, u64 size) { }
++#endif
++
++#endif /* _LINUX_DM_BOOT_KEYS_H */

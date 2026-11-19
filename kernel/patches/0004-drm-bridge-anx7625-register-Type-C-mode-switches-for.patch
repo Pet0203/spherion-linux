@@ -1,0 +1,311 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pet0203 <Pet0203@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:00:00 +0000
+Subject: [PATCH] drm/bridge: anx7625: register Type-C mode switches for DP
+ port selection
+
+The MT8192 Asurada Chromebooks (hayato, spherion) feed a second ANX7625
+from the SoC's DPI output and wire its DisplayPort lanes to both USB-C
+ports. The EC negotiates DP alt mode and drives HPD; the only thing left to
+the AP is choosing which port gets the lanes, which the bridge's crosspoint
+switch does.
+
+Register a Type-C mode switch for each child of a "switches" node.
+cros_ec_typec reaches them through the connectors' graph endpoints and
+calls them when a port enters or leaves DP mode. The callback keeps the
+bridge powered while either port carries DP and points the crosspoint
+switch at that port. Runtime resume writes the switch again: powering the
+bridge off loses the setting, and cros_ec_typec does not repeat an
+unchanged mux state after a system resume.
+
+Boards without a "switches" node are unaffected. A switch that fails to
+register costs DP port selection, not the bridge: probe only warns.
+
+This is not new work. ChromeOS kernels have carried mode-switch support for
+this driver for years, written by Pin-yen Lin and Prashant Malani, and it
+was posted for mainline up to v15 without being merged. This patch adapts
+the chromeos-6.1 version to the driver's current runtime PM and Type-C port
+code; any mistakes in the adaptation are not theirs.
+
+Link: https://patchwork.kernel.org/project/dri-devel/patch/20230331091145.737305-8-treapking@chromium.org/
+Link: https://patchwork.kernel.org/project/dri-devel/patch/20220622173605.1168416-6-pmalani@chromium.org/
+
+Known limitations:
+ - I2C errors while writing the crosspoint switch are not checked.
+ - Unbinding the driver while a port carries DP leaks a runtime PM
+   reference.
+ - With DP on both ports at once, the port that had it first keeps it.
+---
+ drivers/gpu/drm/bridge/analogix/anx7625.c | 166 ++++++++++++++++++++++
+ drivers/gpu/drm/bridge/analogix/anx7625.h |  29 ++++
+ 2 files changed, 195 insertions(+)
+
+diff --git a/drivers/gpu/drm/bridge/analogix/anx7625.c b/drivers/gpu/drm/bridge/analogix/anx7625.c
+index c3af88e14..e7c3384dd 100644
+--- a/drivers/gpu/drm/bridge/analogix/anx7625.c
++++ b/drivers/gpu/drm/bridge/analogix/anx7625.c
+@@ -19,6 +19,8 @@
+ #include <linux/usb.h>
+ #include <linux/usb/pd.h>
+ #include <linux/usb/role.h>
++#include <linux/usb/typec_dp.h>
++#include <linux/usb/typec_mux.h>
+ #include <linux/workqueue.h>
+ 
+ #include <linux/of_graph.h>
+@@ -2729,6 +2731,159 @@ static int anx7625_register_i2c_dummy_clients(struct anx7625_data *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * Some boards (the MT8192 Asurada Chromebooks) put the bridge behind two
++ * USB-C ports. The EC negotiates DP alt mode and drives HPD; the bridge's
++ * crosspoint switch picks which port gets the DP lanes: "normal" feeds the
++ * port behind switch 0, "reverse" the port behind switch 1.
++ */
++static void anx7625_write_crosspoint_switch(struct anx7625_data *ctx)
++{
++	switch (ctx->typec_crosspoint) {
++	case TYPEC_ORIENTATION_NORMAL:
++		anx7625_reg_write(ctx, ctx->i2c.tcpc_client, TCPC_SWITCH_0,
++				  SW_SEL1_SSRX_RX1 | SW_SEL1_DPTX0_RX2);
++		anx7625_reg_write(ctx, ctx->i2c.tcpc_client, TCPC_SWITCH_1,
++				  SW_SEL2_SSTX_TX1 | SW_SEL2_DPTX1_TX2);
++		break;
++	case TYPEC_ORIENTATION_REVERSE:
++		anx7625_reg_write(ctx, ctx->i2c.tcpc_client, TCPC_SWITCH_0,
++				  SW_SEL1_SSRX_RX2 | SW_SEL1_DPTX0_RX1);
++		anx7625_reg_write(ctx, ctx->i2c.tcpc_client, TCPC_SWITCH_1,
++				  SW_SEL2_SSTX_TX2 | SW_SEL2_DPTX1_TX1);
++		break;
++	default:
++		break;
++	}
++}
++
++static int anx7625_typec_mux_set(struct typec_mux_dev *mux,
++				 struct typec_mux_state *state)
++{
++	struct anx7625_port_data *data = typec_mux_get_drvdata(mux);
++	struct anx7625_data *ctx = data->ctx;
++	struct anx7625_port_data *ports = ctx->typec_ports;
++	struct device *dev = ctx->dev;
++	bool was_active, is_active;
++
++	if (ctx->num_typec_switches < 2)
++		return 0;
++
++	guard(mutex)(&ctx->switch_lock);
++
++	was_active = ports[0].dp_connected || ports[1].dp_connected;
++	data->dp_connected = state->alt &&
++			     state->alt->svid == USB_TYPEC_DP_SID &&
++			     state->alt->mode == USB_TYPEC_DP_MODE;
++	is_active = ports[0].dp_connected || ports[1].dp_connected;
++
++	dev_dbg(dev, "mode switch: dp c0=%d c1=%d\n",
++		ports[0].dp_connected, ports[1].dp_connected);
++
++	/* Keep the bridge powered while either port carries DP */
++	if (!was_active && is_active)
++		pm_runtime_get_sync(dev);
++
++	/* With DP on both ports, the port that got it first keeps it */
++	if (ports[0].dp_connected != ports[1].dp_connected) {
++		mutex_lock(&ctx->lock);
++		ctx->typec_crosspoint = ports[0].dp_connected ?
++					TYPEC_ORIENTATION_NORMAL :
++					TYPEC_ORIENTATION_REVERSE;
++		/* Otherwise runtime resume applies it */
++		if (!pm_runtime_suspended(dev))
++			anx7625_write_crosspoint_switch(ctx);
++		mutex_unlock(&ctx->lock);
++	}
++
++	if (was_active && !is_active)
++		pm_runtime_put_sync(dev);
++
++	return 0;
++}
++
++static int anx7625_register_mode_switch(struct anx7625_data *ctx,
++					struct device_node *node)
++{
++	struct device *dev = ctx->dev;
++	struct anx7625_port_data *port_data;
++	struct typec_mux_desc mux_desc = {};
++	char name[32];
++	u32 port_num;
++	int ret;
++
++	ret = of_property_read_u32(node, "reg", &port_num);
++	if (ret)
++		return ret;
++
++	if (port_num >= ctx->num_typec_switches) {
++		dev_err(dev, "Invalid switch number %u\n", port_num);
++		return -EINVAL;
++	}
++
++	port_data = &ctx->typec_ports[port_num];
++	port_data->ctx = ctx;
++	snprintf(name, sizeof(name), "%s-switch%u", dev_name(dev), port_num);
++	mux_desc.fwnode = of_fwnode_handle(node);
++	mux_desc.drvdata = port_data;
++	mux_desc.name = name;
++	mux_desc.set = anx7625_typec_mux_set;
++
++	port_data->typec_mux = typec_mux_register(dev, &mux_desc);
++	if (IS_ERR(port_data->typec_mux)) {
++		ret = PTR_ERR(port_data->typec_mux);
++		port_data->typec_mux = NULL;
++		return ret;
++	}
++
++	return 0;
++}
++
++static void anx7625_unregister_typec_switches(struct anx7625_data *ctx)
++{
++	int i;
++
++	for (i = 0; i < ctx->num_typec_switches; i++) {
++		typec_mux_unregister(ctx->typec_ports[i].typec_mux);
++		ctx->typec_ports[i].typec_mux = NULL;
++	}
++}
++
++static int anx7625_register_typec_switches(struct anx7625_data *ctx)
++{
++	struct device *dev = ctx->dev;
++	struct device_node *switches __free(device_node) =
++		of_get_child_by_name(dev->of_node, "switches");
++	int ret;
++
++	if (!switches)
++		return 0;
++
++	ctx->num_typec_switches = of_get_child_count(switches);
++	if (!ctx->num_typec_switches)
++		return 0;
++
++	ctx->typec_ports = devm_kcalloc(dev, ctx->num_typec_switches,
++					sizeof(*ctx->typec_ports), GFP_KERNEL);
++	if (!ctx->typec_ports)
++		return -ENOMEM;
++
++	for_each_available_child_of_node_scoped(switches, sw) {
++		if (!of_property_read_bool(sw, "mode-switch"))
++			continue;
++
++		ret = anx7625_register_mode_switch(ctx, sw);
++		if (ret) {
++			dev_err(dev, "Failed to register mode switch %pOF: %d\n",
++				sw, ret);
++			anx7625_unregister_typec_switches(ctx);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
+ static int __maybe_unused anx7625_runtime_pm_suspend(struct device *dev)
+ {
+ 	struct anx7625_data *ctx = dev_get_drvdata(dev);
+@@ -2752,6 +2907,7 @@ static int __maybe_unused anx7625_runtime_pm_resume(struct device *dev)
+ 	mutex_lock(&ctx->lock);
+ 
+ 	anx7625_power_on_init(ctx);
++	anx7625_write_crosspoint_switch(ctx);
+ 
+ 	mutex_unlock(&ctx->lock);
+ 
+@@ -2836,6 +2992,7 @@ static int anx7625_i2c_probe(struct i2c_client *client)
+ 	mutex_init(&platform->lock);
+ 	mutex_init(&platform->hdcp_wq_lock);
+ 	mutex_init(&platform->aux_lock);
++	mutex_init(&platform->switch_lock);
+ 
+ 	INIT_DELAYED_WORK(&platform->hdcp_work, hdcp_check_work_func);
+ 	platform->hdcp_workqueue = create_workqueue("hdcp workqueue");
+@@ -2941,6 +3098,14 @@ static int anx7625_i2c_probe(struct i2c_client *client)
+ 	if (ret)
+ 		goto pm_suspend;
+ 
++	/*
++	 * The bridge is already registered, so a missing mode switch costs
++	 * DP port selection, not the display.
++	 */
++	ret = anx7625_register_typec_switches(platform);
++	if (ret)
++		dev_warn(dev, "Type-C mode switches not registered: %d\n", ret);
++
+ 	/* Add work function */
+ 	if (platform->pdata.intp_irq) {
+ 		enable_irq(platform->pdata.intp_irq);
+@@ -2973,6 +3138,7 @@ static void anx7625_i2c_remove(struct i2c_client *client)
+ {
+ 	struct anx7625_data *platform = i2c_get_clientdata(client);
+ 
++	anx7625_unregister_typec_switches(platform);
+ 	anx7625_typec_unregister(platform);
+ 
+ 	drm_bridge_remove(&platform->bridge);
+diff --git a/drivers/gpu/drm/bridge/analogix/anx7625.h b/drivers/gpu/drm/bridge/analogix/anx7625.h
+index 957d234ec..bea4b54ad 100644
+--- a/drivers/gpu/drm/bridge/analogix/anx7625.h
++++ b/drivers/gpu/drm/bridge/analogix/anx7625.h
+@@ -70,6 +70,19 @@
+ #define CMD_SEND_BUF		0xC0
+ #define CMD_RECV_BUF		0xE0
+ 
++/* Crosspoint switch between the DP/USB lanes and the two lane pairs */
++#define TCPC_SWITCH_0 0xB4
++#define SW_SEL1_DPTX0_RX2 BIT(0)
++#define SW_SEL1_DPTX0_RX1 BIT(1)
++#define SW_SEL1_SSRX_RX2 BIT(4)
++#define SW_SEL1_SSRX_RX1 BIT(5)
++
++#define TCPC_SWITCH_1 0xB5
++#define SW_SEL2_DPTX1_TX2 BIT(0)
++#define SW_SEL2_DPTX1_TX1 BIT(1)
++#define SW_SEL2_SSTX_TX2 BIT(4)
++#define SW_SEL2_SSTX_TX1 BIT(5)
++
+ /******** END of I2C Address 0x58 ********/
+ 
+ /***************************************************************/
+@@ -462,9 +475,19 @@ struct anx7625_i2c_client {
+ 	struct i2c_client *tcpc_client;
+ };
+ 
++struct typec_mux_dev;
+ struct typec_port;
+ struct usb_role_switch;
+ 
++struct anx7625_data;
++
++/* One Type-C port the DP output can be steered to, see "switches" in DT */
++struct anx7625_port_data {
++	bool dp_connected;
++	struct typec_mux_dev *typec_mux;
++	struct anx7625_data *ctx;
++};
++
+ #define MAX_BUF_LEN	30
+ struct fw_msg {
+ 	u8 msg_len;
+@@ -509,6 +532,12 @@ struct anx7625_data {
+ 	struct mipi_dsi_device *dsi;
+ 	struct drm_dp_aux aux;
+ 	struct fw_msg send_msg;
++	/* Serialises the Type-C mode switch callbacks */
++	struct mutex switch_lock;
++	int num_typec_switches;
++	struct anx7625_port_data *typec_ports;
++	/* Lanes selected by the crosspoint switch; NONE until a port has DP */
++	enum typec_orientation typec_crosspoint;
+ };
+ 
+ #endif  /* __ANX7625_H__ */

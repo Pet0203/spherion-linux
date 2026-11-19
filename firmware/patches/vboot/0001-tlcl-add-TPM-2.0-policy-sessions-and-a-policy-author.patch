@@ -1,0 +1,757 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pet0203 <Pet0203@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:00:00 +0000
+Subject: [PATCH] tlcl: add TPM 2.0 policy sessions and a policy-authorised NV
+ read
+
+tpm2_lite authorises everything with a password session: the proof is an
+empty password, and whatever comes back off the bus is taken as the TPM's
+answer. That is not enough to release disk keys from an NV index that is
+defined with policyread and no authread, where satisfying the index's
+policy is the only way in and the PIN that satisfies it should not cross
+the bus.
+
+Add the four commands a policy session needs (StartAuthSession, PolicyPCR,
+PolicyAuthValue, FlushContext) and TlclReadPolicy(), an NV_Read authorised
+by that session instead of by a password.
+
+The session is unsalted and unbound on purpose. That leaves its session key
+empty, so the HMAC key is the index's authValue alone, which the caller
+derives from the PIN. Proving knowledge of it does not reveal it, and a
+salted session would need asymmetric crypto this library does not carry.
+
+The response HMAC is verified, not just the command one, so a reply that
+did not come from the TPM is rejected.
+
+What this does NOT give is confidentiality of the data read. The session
+uses no parameter encryption, so the NV contents cross the bus in the
+clear: anything able to observe the TPM's bus during the read sees them.
+Closing that needs an encrypted (salted) session, which is not implemented.
+
+Details that are easy to get wrong, and silent when wrong:
+
+ - Both kinds of NV_Read share a command code, so the marshaller cannot
+   tell from the code which body it was handed, and the response parser
+   cannot tell which authorisation section to expect: a password session's
+   is five bytes, a policy session's is sixty-nine and carries the proof.
+   tpm_set_nv_read_policy() selects one for the duration of the exchange,
+   following tpm_set_ph_disabled(), which exists for the same reason.
+
+ - cpHash covers the Name of both handles, and for NV_Read both handles
+   are the index, so its Name is hashed twice. The Name is taken from
+   NV_ReadPublic rather than recomputed.
+
+ - tlcl.h is shared with TPM 1.2 builds and must not name TPM2-only types,
+   so the new declarations use uint32_t rather than TPM_HANDLE.
+
+ - TlclGetRandom() reports a short read rather than failing, and the Cr50
+   routinely returns fewer bytes than asked for. The session nonces are
+   therefore gathered in a loop.
+
+ - TPM_BUFFER_SIZE grows from 256 to 1024 bytes so that a 780-byte key
+   block fits in one exchange (the Cr50's TPM2_PT_INPUT_BUFFER is 0x400).
+   It costs 768 bytes of BSS: the TPM2B structures hold pointers into that
+   buffer rather than copies.
+
+ - The read's length check is written out. sizeof() of the TPM2B's buffer
+   member is the size of a pointer here, which would cap every read at 8
+   bytes.
+
+ - tlcl.a gets its own copy of 2hmac.c. hmac() lives in the firmware
+   library, which the linker searches before tlcl.a, so nothing had pulled
+   the object in by the time tlcl.o needed it. An archive member is only
+   taken to resolve a still-undefined symbol, so the two never collide.
+
+Exercised against a Cr50 (H1, RW 0.5.241) on google,spherion: the policy
+digest, both HMACs and a single 780-byte read.
+---
+ Makefile                              |   3 +-
+ firmware/include/tlcl.h               |  25 +++
+ firmware/include/tpm2_marshaling.h    |  10 +
+ firmware/include/tpm2_tss_constants.h |  69 ++++++-
+ firmware/lib/tpm2_lite/marshaling.c   | 153 ++++++++++++++-
+ firmware/lib/tpm2_lite/tlcl.c         | 268 ++++++++++++++++++++++++++
+ 6 files changed, 524 insertions(+), 4 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 5f5132c..b5b48fa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -426,7 +426,8 @@ else
+ # TODO(apronin): tests for TPM2 case?
+ TLCL_SRCS = \
+ 	firmware/lib/tpm2_lite/tlcl.c \
+-	firmware/lib/tpm2_lite/marshaling.c
++	firmware/lib/tpm2_lite/marshaling.c \
++	firmware/2lib/2hmac.c
+ endif
+ 
+ # Support real TPM unless MOCK_TPM is set
+diff --git a/firmware/include/tlcl.h b/firmware/include/tlcl.h
+index d33fa47..32ca100 100644
+--- a/firmware/include/tlcl.h
++++ b/firmware/include/tlcl.h
+@@ -119,6 +119,31 @@ uint32_t TlclWrite(uint32_t index, const void *data, uint32_t length);
+  */
+ uint32_t TlclRead(uint32_t index, void *data, uint32_t length);
+ 
++/**
++ * Policy sessions, for reading an NV index sealed to PCR values and a PIN.
++ *
++ * The index the disk keys live in is defined with policyread and no authread,
++ * so it cannot be read with a password at all: satisfying its policy is the
++ * only way in. TlclStartAuthSession opens the session and returns the TPM's
++ * nonce, TlclPolicyPCR and TlclPolicyAuthValue drive the policy to the value
++ * the index was sealed under, and TlclReadPolicy performs the authorized read
++ * and checks the HMAC on the way back. TlclFlushContext releases the session;
++ * the TPM holds only a few, so leaking them wedges later boots.
++ *
++ * |nonce_tpm| is SHA256_DIGEST_SIZE bytes, carried from TlclStartAuthSession
++ * into TlclReadPolicy, which rolls it forward. |auth| is the index's authValue,
++ * which the caller derives from the PIN -- it is the HMAC key and never
++ * appears on the bus.
++ */
++uint32_t TlclStartAuthSession(uint32_t *session_handle, uint8_t *nonce_tpm);
++uint32_t TlclPolicyPCR(uint32_t session_handle,
++		       uint32_t pcr_selection_bitmap);
++uint32_t TlclPolicyAuthValue(uint32_t session_handle);
++uint32_t TlclReadPolicy(uint32_t index, void *data, uint32_t length,
++			uint32_t session_handle, uint8_t *nonce_tpm,
++			const uint8_t *auth, uint32_t auth_size);
++uint32_t TlclFlushContext(uint32_t handle);
++
+ /**
+  * Read PCR at [index] into [data].  [length] must be TPM_PCR_DIGEST or
+  * larger. The TPM error code is returned.
+diff --git a/firmware/include/tpm2_marshaling.h b/firmware/include/tpm2_marshaling.h
+index 9fd79da..1d69204 100644
+--- a/firmware/include/tpm2_marshaling.h
++++ b/firmware/include/tpm2_marshaling.h
+@@ -79,6 +79,16 @@ uint32_t tpm_get_packet_response_code(const uint8_t *packet);
+  */
+ void tpm_set_ph_disabled(int flag);
+ 
++/**
++ * tpm_set_nv_read_policy
++ *
++ * A policy-authorized NV_Read and a password one share a command code, so the
++ * marshaller cannot tell from the code alone which body it was given. The
++ * caller sets this for the duration of the exchange; the response parser reads
++ * it too, because the authorization section differs in size and meaning.
++ */
++void tpm_set_nv_read_policy(int flag);
++
+ /**
+  * tpm_is_ph_disabled
+  *
+diff --git a/firmware/include/tpm2_tss_constants.h b/firmware/include/tpm2_tss_constants.h
+index becd710..0e9e868 100644
+--- a/firmware/include/tpm2_tss_constants.h
++++ b/firmware/include/tpm2_tss_constants.h
+@@ -13,7 +13,14 @@
+ extern "C" {
+ #endif  /* __cplusplus */
+ 
+-#define TPM_BUFFER_SIZE 256
++/*
++ * Big enough for the firmware unlock's key block in one exchange. vboot's own
++ * NV spaces are tens of bytes, so 256 was plenty; the disk keys are 780, and
++ * the Cr50 hands all of them back in a single NV_Read (its own
++ * TPM2_PT_INPUT_BUFFER is 0x400). The cost is 768 bytes of BSS: the TPM2B
++ * structures hold pointers into this buffer rather than copies.
++ */
++#define TPM_BUFFER_SIZE 1024
+ 
+ /* Tpm2 command tags. */
+ #define TPM_ST_NO_SESSIONS 0x8001
+@@ -35,6 +42,13 @@ extern "C" {
+ #define TPM2_GetCapability     ((TPM_CC)0x0000017A)
+ #define TPM2_GetRandom         ((TPM_CC)0x0000017B)
+ #define TPM2_PCR_Extend        ((TPM_CC)0x00000182)
++/* Policy sessions. The unlock reads an NV index whose authPolicy is
++ * PolicyPCR + PolicyAuthValue, which needs a real session rather than the
++ * password sessions the rest of this file uses. */
++#define TPM2_StartAuthSession  ((TPM_CC)0x00000176)
++#define TPM2_PolicyPCR         ((TPM_CC)0x0000017F)
++#define TPM2_PolicyAuthValue   ((TPM_CC)0x0000016B)
++#define TPM2_FlushContext      ((TPM_CC)0x00000165)
+ 
+ #define TPM_HT_PCR             0x00
+ #define TPM_HT_NV_INDEX        0x01
+@@ -45,6 +59,9 @@ extern "C" {
+ #define TPM_RH_OWNER        0x40000001
+ #define TPM_RH_PLATFORM     0x4000000C
+ #define TPM_RS_PW           0x40000009
++#define TPM_RH_NULL         0x40000007
++/* TPM_SE_POLICY: a session whose authorization is a policy, not a password. */
++#define TPM_SE_POLICY       ((uint8_t)0x01)
+ 
+ /* TPM2 capabilities. */
+ #define TPM_CAP_FIRST                   ((TPM_CAP)0x00000000)
+@@ -252,6 +269,42 @@ struct tpm2_pcr_extend_cmd {
+ 	TPML_DIGEST_VALUES digests;
+ };
+ 
++/*
++ * The session is started unsalted (tpmKey = TPM_RH_NULL) and unbound
++ * (bind = TPM_RH_NULL). That is deliberate: it makes the session key empty,
++ * so the HMAC key is the NV index's authValue on its own, which is the one
++ * secret the firmware derives from the PIN. A salted session would need
++ * asymmetric work this library does not have.
++ */
++struct tpm2_start_auth_session_cmd {
++	uint8_t nonce_caller[SHA256_DIGEST_SIZE];
++};
++
++struct tpm2_policy_pcr_cmd {
++	TPM_HANDLE session_handle;
++	/* One bit per PCR, matching the TPML_PCR_SELECTION bitmap. */
++	uint32_t pcr_selection_bitmap;
++};
++
++struct tpm2_policy_authvalue_cmd {
++	TPM_HANDLE session_handle;
++};
++
++struct tpm2_flush_context_cmd {
++	TPM_HANDLE flush_handle;
++};
++
++/* NV_Read authorized by a policy session instead of an empty password. */
++struct tpm2_nv_read_policy_cmd {
++	TPMI_RH_NV_INDEX nvIndex;
++	uint16_t size;
++	uint16_t offset;
++	TPM_HANDLE session_handle;
++	uint8_t nonce_caller[SHA256_DIGEST_SIZE];
++	uint8_t session_attrs;
++	uint8_t hmac[SHA256_DIGEST_SIZE];
++};
++
+ /* Common command/response header. */
+ struct tpm_header {
+ 	uint16_t tpm_tag;
+@@ -262,6 +315,19 @@ struct tpm_header {
+ struct nv_read_response {
+ 	uint32_t params_size;
+ 	TPM2B_MAX_NV_BUFFER buffer;
++	/*
++	 * Only meaningful for a read authorized by a session: the response
++	 * HMAC is what proves the answer came from the TPM rather than from
++	 * whatever else can reach the bus.
++	 */
++	TPM2B_DIGEST nonce_tpm;
++	uint8_t session_attrs;
++	TPM2B_DIGEST hmac;
++};
++
++struct start_auth_session_response {
++	TPM_HANDLE session_handle;
++	TPM2B_DIGEST nonce_tpm;
+ };
+ 
+ struct tpm2_session_attrs {
+@@ -308,6 +374,7 @@ struct tpm2_response {
+ 		struct get_capability_response cap;
+ 		struct get_random_response random;
+ 		struct nv_read_public_response nv_read_public;
++		struct start_auth_session_response auth_session;
+ 	};
+ };
+ 
+diff --git a/firmware/lib/tpm2_lite/marshaling.c b/firmware/lib/tpm2_lite/marshaling.c
+index b9857d4..fd820ba 100644
+--- a/firmware/lib/tpm2_lite/marshaling.c
++++ b/firmware/lib/tpm2_lite/marshaling.c
+@@ -8,6 +8,14 @@
+ #include "tpm2_marshaling.h"
+ 
+ static uint16_t tpm_tag;  /* Depends on the command type. */
++
++/*
++ * Set while marshaling an NV_Read authorized by a policy session. The response
++ * parser has to know which shape to expect: a password session's authorization
++ * section is five bytes and carries nothing, while a policy session's holds the
++ * TPM nonce and the HMAC that prove the answer came from the TPM.
++ */
++static int nv_read_session_auth;
+ static int ph_disabled;   /* Platform hierarchy disabled. */
+ 
+ static void write_be16(void *dest, uint16_t val)
+@@ -136,6 +144,16 @@ static void unmarshal_authorization_section(void **buffer, int *size,
+ 	*size = 0;
+ }
+ 
++static void unmarshal_TPM2B(void **buffer, int *size, TPM2B *tpm2b);
++
++static void unmarshal_session_authorization(void **buffer, int *size,
++					    struct nv_read_response *nvr)
++{
++	unmarshal_TPM2B(buffer, size, &nvr->nonce_tpm);
++	nvr->session_attrs = unmarshal_u8(buffer, size);
++	unmarshal_TPM2B(buffer, size, &nvr->hmac);
++}
++
+ static void unmarshal_nv_read(void **buffer, int *size,
+ 			      struct nv_read_response *nvr)
+ {
+@@ -153,7 +171,10 @@ static void unmarshal_nv_read(void **buffer, int *size,
+ 	if (*size < 0)
+ 		return;
+ 
+-	unmarshal_authorization_section(buffer, size, "NV_Read");
++	if (nv_read_session_auth)
++		unmarshal_session_authorization(buffer, size, nvr);
++	else
++		unmarshal_authorization_section(buffer, size, "NV_Read");
+ }
+ 
+ static void unmarshal_TPM2B(void **buffer,
+@@ -200,6 +221,18 @@ static void unmarshal_TPMS_NV_PUBLIC(void **buffer,
+ 	}
+ }
+ 
++static void unmarshal_start_auth_session(void **buffer, int *size,
++					 struct start_auth_session_response *r)
++{
++	r->session_handle = unmarshal_u32(buffer, size);
++	unmarshal_TPM2B(buffer, size, &r->nonce_tpm);
++
++	if (*size > 0) {
++		VB2_DEBUG("extra %d bytes after nonceTPM\n", *size);
++		*size = -1;
++	}
++}
++
+ static void unmarshal_nv_read_public(void **buffer, int *size,
+ 				     struct nv_read_public_response *nv_pub)
+ {
+@@ -555,6 +588,83 @@ static void marshal_nv_read(void **buffer,
+ 	marshal_u16(buffer, command_body->offset, buffer_space);
+ }
+ 
++static void marshal_start_auth_session(void **buffer,
++				      struct tpm2_start_auth_session_cmd *cmd,
++				      int *buffer_space)
++{
++	/* Unsalted and unbound: both key handles are TPM_RH_NULL. */
++	marshal_TPM_HANDLE(buffer, TPM_RH_NULL, buffer_space);
++	marshal_TPM_HANDLE(buffer, TPM_RH_NULL, buffer_space);
++	marshal_u16(buffer, SHA256_DIGEST_SIZE, buffer_space);
++	marshal_blob(buffer, cmd->nonce_caller, SHA256_DIGEST_SIZE,
++		     buffer_space);
++	marshal_u16(buffer, 0, buffer_space);	/* no encrypted salt */
++	marshal_u8(buffer, TPM_SE_POLICY, buffer_space);
++	marshal_u16(buffer, TPM_ALG_NULL, buffer_space);   /* no parameter encryption */
++	marshal_u16(buffer, TPM_ALG_SHA256, buffer_space);
++}
++
++static void marshal_policy_pcr(void **buffer,
++			       struct tpm2_policy_pcr_cmd *cmd,
++			       int *buffer_space)
++{
++	uint32_t bitmap = cmd->pcr_selection_bitmap;
++
++	marshal_TPM_HANDLE(buffer, cmd->session_handle, buffer_space);
++	/*
++	 * An empty pcrDigest tells the TPM to use the PCRs as they are now,
++	 * which is what we want: the policy either matches this boot or it
++	 * does not.
++	 */
++	marshal_u16(buffer, 0, buffer_space);
++	marshal_u32(buffer, 1, buffer_space);		/* one selection */
++	marshal_u16(buffer, TPM_ALG_SHA256, buffer_space);
++	marshal_u8(buffer, 3, buffer_space);		/* three bitmap bytes */
++	marshal_u8(buffer, bitmap & 0xff, buffer_space);
++	marshal_u8(buffer, (bitmap >> 8) & 0xff, buffer_space);
++	marshal_u8(buffer, (bitmap >> 16) & 0xff, buffer_space);
++}
++
++static void marshal_policy_authvalue(void **buffer,
++				     struct tpm2_policy_authvalue_cmd *cmd,
++				     int *buffer_space)
++{
++	marshal_TPM_HANDLE(buffer, cmd->session_handle, buffer_space);
++}
++
++static void marshal_flush_context(void **buffer,
++				  struct tpm2_flush_context_cmd *cmd,
++				  int *buffer_space)
++{
++	/* FlushContext takes its handle in the parameter area, not as a
++	 * handle, so it is marshalled like any other u32. */
++	marshal_u32(buffer, cmd->flush_handle, buffer_space);
++}
++
++static void marshal_nv_read_policy(void **buffer,
++				   struct tpm2_nv_read_policy_cmd *cmd,
++				   int *buffer_space)
++{
++	struct tpm2_session_header session_header;
++
++	/* The index authorizes itself: its policy is what is being satisfied. */
++	marshal_TPM_HANDLE(buffer, cmd->nvIndex, buffer_space);
++	marshal_TPM_HANDLE(buffer, cmd->nvIndex, buffer_space);
++
++	memset(&session_header, 0, sizeof(session_header));
++	session_header.session_handle = cmd->session_handle;
++	session_header.nonce_size = SHA256_DIGEST_SIZE;
++	session_header.nonce = cmd->nonce_caller;
++	session_header.session_attrs = cmd->session_attrs;
++	session_header.auth_size = SHA256_DIGEST_SIZE;
++	session_header.auth = cmd->hmac;
++	marshal_session_header(buffer, &session_header, buffer_space);
++	tpm_tag = TPM_ST_SESSIONS;
++
++	marshal_u16(buffer, cmd->size, buffer_space);
++	marshal_u16(buffer, cmd->offset, buffer_space);
++}
++
+ static void marshal_nv_read_lock(void **buffer,
+ 				  struct tpm2_nv_read_lock_cmd *command_body,
+ 				  int *buffer_space)
+@@ -735,7 +845,30 @@ int tpm_marshal_command(TPM_CC command, void *tpm_command_body,
+ 		break;
+ 
+ 	case TPM2_NV_Read:
+-		marshal_nv_read(&cmd_body, tpm_command_body, &body_size);
++		if (nv_read_session_auth)
++			marshal_nv_read_policy(&cmd_body, tpm_command_body,
++					       &body_size);
++		else
++			marshal_nv_read(&cmd_body, tpm_command_body,
++					&body_size);
++		break;
++
++	case TPM2_StartAuthSession:
++		marshal_start_auth_session(&cmd_body, tpm_command_body,
++					   &body_size);
++		break;
++
++	case TPM2_PolicyPCR:
++		marshal_policy_pcr(&cmd_body, tpm_command_body, &body_size);
++		break;
++
++	case TPM2_PolicyAuthValue:
++		marshal_policy_authvalue(&cmd_body, tpm_command_body,
++					 &body_size);
++		break;
++
++	case TPM2_FlushContext:
++		marshal_flush_context(&cmd_body, tpm_command_body, &body_size);
+ 		break;
+ 
+ 	case TPM2_NV_Write:
+@@ -838,6 +971,17 @@ int tpm_unmarshal_response(TPM_CC command,
+ 				         &response->nv_read_public);
+ 		break;
+ 
++	case TPM2_StartAuthSession:
++		unmarshal_start_auth_session(&response_body, &cr_size,
++					     &response->auth_session);
++		break;
++
++	case TPM2_PolicyPCR:
++	case TPM2_PolicyAuthValue:
++	case TPM2_FlushContext:
++		/* These return nothing beyond the response code. */
++		break;
++
+ 	case TPM2_GetCapability:
+ 		unmarshal_get_capability(&response_body, &cr_size,
+ 					 &response->cap);
+@@ -917,6 +1061,11 @@ void tpm_set_ph_disabled(int flag)
+ 	ph_disabled = flag;
+ }
+ 
++void tpm_set_nv_read_policy(int flag)
++{
++	nv_read_session_auth = flag;
++}
++
+ int tpm_is_ph_disabled(void)
+ {
+ 	return ph_disabled;
+diff --git a/firmware/lib/tpm2_lite/tlcl.c b/firmware/lib/tpm2_lite/tlcl.c
+index b91119b..95ac246 100644
+--- a/firmware/lib/tpm2_lite/tlcl.c
++++ b/firmware/lib/tpm2_lite/tlcl.c
+@@ -9,6 +9,8 @@
+ #include "2common.h"
+ #include "2sysincludes.h"
+ #include "tlcl.h"
++#include "2hmac.h"
++#include "2sha.h"
+ #include "tpm2_marshaling.h"
+ 
+ /*
+@@ -683,3 +685,269 @@ uint32_t TlclIFXFieldUpgradeInfo(TPM_IFX_FIELDUPGRADEINFO* info)
+ 	VB2_DEBUG("NOT YET IMPLEMENTED\n");
+ 	return TPM_E_IOERROR;
+ }
++
++/*
++ * Policy sessions, for the firmware unlock.
++ *
++ * Everything above authorizes with a password session: the proof is an empty
++ * password and the TPM's answer is taken on faith. Neither is good enough for
++ * the disk keys. The PIN must not cross the bus, and the reply has to be
++ * provably the TPM's rather than whatever else can reach the SPI lines. Both
++ * follow from an HMAC session. Because the session is unsalted and unbound its
++ * session key is empty, which leaves the index's authValue as the whole HMAC
++ * key -- and that authValue is derived from the PIN, so proving knowledge of it
++ * never reveals it.
++ */
++
++/* cpHash = H(commandCode || names of both handles || parameters). Both handles
++ * of NV_Read are the index itself, so its Name is hashed twice. */
++static uint32_t nv_read_cp_hash(const uint8_t *name, uint16_t name_size,
++				uint16_t size, uint16_t offset, uint8_t *out)
++{
++	struct vb2_digest_context dc;
++	uint8_t be[4];
++
++	if (vb2_digest_init(&dc, VB2_HASH_SHA256) != VB2_SUCCESS)
++		return TPM_E_INTERNAL_ERROR;
++
++	be[0] = (TPM2_NV_Read >> 24) & 0xff;
++	be[1] = (TPM2_NV_Read >> 16) & 0xff;
++	be[2] = (TPM2_NV_Read >> 8) & 0xff;
++	be[3] = TPM2_NV_Read & 0xff;
++	vb2_digest_extend(&dc, be, sizeof(be));
++	vb2_digest_extend(&dc, name, name_size);
++	vb2_digest_extend(&dc, name, name_size);
++
++	be[0] = (size >> 8) & 0xff;
++	be[1] = size & 0xff;
++	be[2] = (offset >> 8) & 0xff;
++	be[3] = offset & 0xff;
++	vb2_digest_extend(&dc, be, sizeof(be));
++
++	if (vb2_digest_finalize(&dc, out, SHA256_DIGEST_SIZE) != VB2_SUCCESS)
++		return TPM_E_INTERNAL_ERROR;
++
++	return TPM_SUCCESS;
++}
++
++/* The HMAC covers the command or response hash and both nonces, which is what
++ * stops a recorded exchange being replayed. */
++static uint32_t session_hmac(const uint8_t *auth, uint32_t auth_size,
++			     const uint8_t *hash, const uint8_t *nonce_newer,
++			     const uint8_t *nonce_older, uint8_t attrs,
++			     uint8_t *out)
++{
++	uint8_t msg[SHA256_DIGEST_SIZE * 3 + 1];
++
++	memcpy(msg, hash, SHA256_DIGEST_SIZE);
++	memcpy(msg + SHA256_DIGEST_SIZE, nonce_newer, SHA256_DIGEST_SIZE);
++	memcpy(msg + SHA256_DIGEST_SIZE * 2, nonce_older, SHA256_DIGEST_SIZE);
++	msg[SHA256_DIGEST_SIZE * 3] = attrs;
++
++	if (hmac(VB2_HASH_SHA256, auth, auth_size, msg, sizeof(msg),
++		 out, SHA256_DIGEST_SIZE))
++		return TPM_E_INTERNAL_ERROR;
++
++	return TPM_SUCCESS;
++}
++
++/*
++ * A full-length nonce, however many calls it takes.
++ *
++ * TlclGetRandom reports a short read instead of failing -- it only errors when
++ * the TPM returns MORE than was asked for -- and the Cr50 routinely returns
++ * less. Treating that as fatal is what made the first firmware unlock fail
++ * with TPM_E_INTERNAL_ERROR before it had sent a single session command.
++ */
++static uint32_t session_nonce(uint8_t *out)
++{
++	uint32_t got = 0, size, rv;
++	int tries;
++
++	for (tries = 0; tries < 8 && got < SHA256_DIGEST_SIZE; tries++) {
++		size = 0;
++		rv = TlclGetRandom(out + got, SHA256_DIGEST_SIZE - got, &size);
++		if (rv != TPM_SUCCESS)
++			return rv;
++		if (size == 0)
++			break;
++		got += size;
++	}
++
++	if (got != SHA256_DIGEST_SIZE) {
++		VB2_DEBUG("only got %u of %u nonce bytes\n",
++			  got, (uint32_t)SHA256_DIGEST_SIZE);
++		return TPM_E_INTERNAL_ERROR;
++	}
++
++	return TPM_SUCCESS;
++}
++
++uint32_t TlclStartAuthSession(uint32_t *session_handle, uint8_t *nonce_tpm)
++{
++	struct tpm2_response *response = &tpm2_resp;
++	struct tpm2_start_auth_session_cmd cmd;
++	uint32_t rv;
++
++	memset(&cmd, 0, sizeof(cmd));
++	/* A fresh nonceCaller per session; the TPM answers with its own. */
++	rv = session_nonce(cmd.nonce_caller);
++	if (rv != TPM_SUCCESS)
++		return rv;
++
++	rv = tpm_send_receive(TPM2_StartAuthSession, &cmd, response);
++	if (rv != TPM_SUCCESS)
++		return rv;
++
++	if (response->auth_session.nonce_tpm.size != SHA256_DIGEST_SIZE)
++		return TPM_E_INTERNAL_ERROR;
++
++	*session_handle = response->auth_session.session_handle;
++	memcpy(nonce_tpm, response->auth_session.nonce_tpm.buffer,
++	       SHA256_DIGEST_SIZE);
++
++	return TPM_SUCCESS;
++}
++
++uint32_t TlclPolicyPCR(uint32_t session_handle, uint32_t pcr_selection_bitmap)
++{
++	struct tpm2_policy_pcr_cmd cmd;
++
++	cmd.session_handle = session_handle;
++	cmd.pcr_selection_bitmap = pcr_selection_bitmap;
++
++	return tpm_get_response_code(TPM2_PolicyPCR, &cmd);
++}
++
++uint32_t TlclPolicyAuthValue(uint32_t session_handle)
++{
++	struct tpm2_policy_authvalue_cmd cmd;
++
++	cmd.session_handle = session_handle;
++
++	return tpm_get_response_code(TPM2_PolicyAuthValue, &cmd);
++}
++
++uint32_t TlclFlushContext(uint32_t handle)
++{
++	struct tpm2_flush_context_cmd cmd;
++
++	cmd.flush_handle = handle;
++
++	return tpm_get_response_code(TPM2_FlushContext, &cmd);
++}
++
++uint32_t TlclReadPolicy(uint32_t index, void *data, uint32_t length,
++			uint32_t session_handle, uint8_t *nonce_tpm,
++			const uint8_t *auth, uint32_t auth_size)
++{
++	struct tpm2_response *response = &tpm2_resp;
++	struct nv_read_public_response *nv_public;
++	struct tpm2_nv_read_policy_cmd cmd;
++	uint8_t name[sizeof(TPMU_HA) + sizeof(uint16_t)];
++	uint8_t cp_hash[SHA256_DIGEST_SIZE];
++	uint8_t rp_hash[SHA256_DIGEST_SIZE];
++	uint8_t expected[SHA256_DIGEST_SIZE];
++	struct vb2_digest_context dc;
++	uint16_t name_size;
++	uint8_t be[4];
++	uint32_t rv;
++
++	/*
++	 * The whole response has to fit in TLCL's command buffer: the header,
++	 * the parameter size, the data's own size field, and the session's
++	 * nonce, attributes and HMAC -- 85 bytes of it, rounded up here.
++	 *
++	 * The bound used to be sizeof(...->t.buffer), which in this TPM2B is a
++	 * POINTER into the response buffer rather than an array. That made the
++	 * limit 8 bytes and refused every read worth doing, with
++	 * TPM_E_BUFFER_SIZE and no hint as to why.
++	 */
++	if (length > TPM_BUFFER_SIZE - 128)
++		return TPM_E_BUFFER_SIZE;
++
++	/* The Name goes into cpHash. Ask the TPM for it rather than
++	 * recomputing it from the public area and risking disagreement. */
++	rv = tlcl_nv_read_public(index, &nv_public);
++	if (rv != TPM_SUCCESS)
++		return rv;
++	name_size = nv_public->nvName.size;
++	if (name_size > sizeof(name))
++		return TPM_E_INTERNAL_ERROR;
++	memcpy(name, nv_public->nvName.buffer, name_size);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.nvIndex = HR_NV_INDEX + index;
++	cmd.size = length;
++	cmd.offset = 0;
++	cmd.session_handle = session_handle;
++	cmd.session_attrs = 1;	/* continueSession: we flush it ourselves */
++
++	/* A fresh nonce for this command, or the HMAC could be replayed. */
++	rv = session_nonce(cmd.nonce_caller);
++	if (rv != TPM_SUCCESS)
++		return rv;
++
++	rv = nv_read_cp_hash(name, name_size, cmd.size, cmd.offset, cp_hash);
++	if (rv != TPM_SUCCESS)
++		return rv;
++
++	rv = session_hmac(auth, auth_size, cp_hash, cmd.nonce_caller,
++			  nonce_tpm, cmd.session_attrs, cmd.hmac);
++	if (rv != TPM_SUCCESS)
++		return rv;
++
++	/* Both reads are TPM2_NV_Read on the wire, so the marshaller is told
++	 * which body it has been handed. Cleared again below, including on the
++	 * failure paths, or the next password read is misparsed. */
++	tpm_set_nv_read_policy(1);
++	rv = tpm_send_receive(TPM2_NV_Read, &cmd, response);
++	tpm_set_nv_read_policy(0);
++	if (rv != TPM_SUCCESS)
++		return rv;
++
++	if (response->nvr.buffer.t.size != length)
++		return TPM_E_RESPONSE_TOO_LARGE;
++	if (response->nvr.nonce_tpm.size != SHA256_DIGEST_SIZE ||
++	    response->nvr.hmac.size != SHA256_DIGEST_SIZE)
++		return TPM_E_INTERNAL_ERROR;
++
++	/* rpHash = H(responseCode || commandCode || responseParameters).
++	 * Verifying it is what makes the answer the TPM's rather than the
++	 * bus's. */
++	if (vb2_digest_init(&dc, VB2_HASH_SHA256) != VB2_SUCCESS)
++		return TPM_E_INTERNAL_ERROR;
++	memset(be, 0, sizeof(be));			/* TPM_RC_SUCCESS */
++	vb2_digest_extend(&dc, be, sizeof(be));
++	be[0] = (TPM2_NV_Read >> 24) & 0xff;
++	be[1] = (TPM2_NV_Read >> 16) & 0xff;
++	be[2] = (TPM2_NV_Read >> 8) & 0xff;
++	be[3] = TPM2_NV_Read & 0xff;
++	vb2_digest_extend(&dc, be, sizeof(be));
++	be[0] = (response->nvr.buffer.t.size >> 8) & 0xff;
++	be[1] = response->nvr.buffer.t.size & 0xff;
++	vb2_digest_extend(&dc, be, 2);
++	vb2_digest_extend(&dc, response->nvr.buffer.t.buffer,
++			  response->nvr.buffer.t.size);
++	if (vb2_digest_finalize(&dc, rp_hash, sizeof(rp_hash)) != VB2_SUCCESS)
++		return TPM_E_INTERNAL_ERROR;
++
++	rv = session_hmac(auth, auth_size, rp_hash,
++			  response->nvr.nonce_tpm.buffer, cmd.nonce_caller,
++			  response->nvr.session_attrs, expected);
++	if (rv != TPM_SUCCESS)
++		return rv;
++
++	if (vb2_safe_memcmp(expected, response->nvr.hmac.buffer,
++			    SHA256_DIGEST_SIZE)) {
++		VB2_DEBUG("NV_Read response HMAC mismatch\n");
++		return TPM_E_AUTHFAIL;
++	}
++
++	memcpy(data, response->nvr.buffer.t.buffer, length);
++
++	/* The TPM's nonce rolls forward for any later use of this session. */
++	memcpy(nonce_tpm, response->nvr.nonce_tpm.buffer, SHA256_DIGEST_SIZE);
++
++	return TPM_SUCCESS;
++}

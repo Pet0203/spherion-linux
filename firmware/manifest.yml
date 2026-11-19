@@ -1,0 +1,47 @@
+# Pinned sources for the firmware of the Acer Chromebook 514 CB514-2H
+# (google,spherion, MediaTek MT8192, "asurada" baseboard).
+#
+# "stock" is what Google built Google_Spherion.13885.143.0 (the RW firmware)
+# from. The commits were read out of a stock firmware image itself: the CBFS
+# "config" and "revision" files, the BL31 version string, and the version
+# string inside ecrw. The five MediaTek blobs in the blobs repository at the
+# pinned commit were compared byte for byte with the ones in that image.
+#
+# fetch-sources.sh and build.sh read this file with awk, not with a YAML
+# parser: keep the two-space indentation and one "commit:" line per entry.
+
+stock:
+  firmware_version: "13885.143.0"
+  coreboot:
+    url: https://chromium.googlesource.com/chromiumos/third_party/coreboot
+    branch: firmware-asurada-13885.B
+    commit: ac8742969fef1ce3bb4cfa0e5bae206661ad7648
+    config: firmware/configs/coreboot-spherion.config
+  arm-trusted-firmware:
+    url: https://chromium.googlesource.com/chromiumos/third_party/arm-trusted-firmware
+    path: coreboot/3rdparty/arm-trusted-firmware
+    commit: ce3ebc861e32564665a5862f42da3fcd6b12722a
+  vboot:
+    url: https://chromium.googlesource.com/chromiumos/platform/vboot_reference
+    path: coreboot/3rdparty/vboot
+    commit: 25797a2876988a7488578015a995f612b2a9cbde
+  blobs:
+    url: https://chromium.googlesource.com/chromiumos/third_party/coreboot/blobs
+    path: coreboot/3rdparty/blobs
+    commit: 081e491e8260417805c65422d0c112b1b464e821
+  depthcharge:
+    url: https://chromium.googlesource.com/chromiumos/platform/depthcharge
+    commit: 1bfae950bf91da6e339465f3bd6ad41bedb360d9
+    board: asurada
+    libpayload_config: firmware/configs/libpayload-asurada.config
+  ec:
+    url: https://chromium.googlesource.com/chromiumos/platform/ec
+    branch: firmware-asurada-13885.B-main
+    commit: b71e828911908260e991ecd6a7867cc9868613bc
+    board: spherion
+
+# Where the two files in firmware/configs/ come from:
+# chromiumos-overlay, branch firmware-asurada-13885.B, commit
+# afa4b331e22ea11e84a9a36bbae782d2660b8309
+#   sys-boot/coreboot/files/configs/config.spherion
+#   sys-boot/libpayload/files/configs/config.asurada
